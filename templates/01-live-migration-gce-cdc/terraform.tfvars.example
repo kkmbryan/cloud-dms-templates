@@ -1,0 +1,31 @@
+# ==============================================================================
+# Scenario 1: Live GCE MySQL 8.0 -> Cloud SQL (8.4 / 8.0) + CDC Example
+# ==============================================================================
+
+project_id            = "my-gcp-project-01"
+region                = "asia-southeast1"
+connectivity_type     = "PSC"
+network               = "projects/my-gcp-project-01/global/networks/prod-vpc"
+subnet                = "projects/my-gcp-project-01/regions/asia-southeast1/subnetworks/db-subnet-sg"
+dms_tenant_project_id = "" # Populate with 'p123456-abcdef-tp' once Cloud SQL/DMS tenant project is generated
+
+# Destination Cloud SQL Configuration (MYSQL_8_4 default or MYSQL_8_0)
+cloudsql_instance_name       = "cloudsql-mysql-dest-live-01"
+target_database_version      = "MYSQL_8_4"
+cloudsql_edition             = "ENTERPRISE_PLUS"
+cloudsql_tier                = "db-perf-optimized-N-8"
+cloudsql_availability_type   = "REGIONAL"
+cloudsql_disk_size_gb        = 500
+cloudsql_root_password       = "REPLACE_WITH_SECURE_ROOT_PASSWORD"
+cloudsql_deletion_protection = true
+
+# Source GCE MySQL 8.0 VM Configuration
+source_gce_mysql_host     = "10.148.0.25"
+source_gce_mysql_port     = 3306
+source_gce_mysql_username = "dms_repl_user"
+source_gce_mysql_password = "REPLACE_WITH_SECURE_REPL_PASSWORD"
+
+# DMS Live Migration + CDC Job Configuration
+migration_job_id    = "gce-live-mysql80-cdc"
+dump_parallel_level = "MAX"
+connectivity_method = "VPC_PEERING"

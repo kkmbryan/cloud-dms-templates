@@ -1,0 +1,38 @@
+# ==============================================================================
+# Scenario 2: Backup in GCS (XtraBackup / mysqldump) + CDC Example
+# ==============================================================================
+
+project_id            = "my-gcp-project-01"
+region                = "asia-southeast1"
+connectivity_type     = "PSC"
+network               = "projects/my-gcp-project-01/global/networks/prod-vpc"
+subnet                = "projects/my-gcp-project-01/regions/asia-southeast1/subnetworks/db-subnet-sg"
+dms_tenant_project_id = "" # Populate with 'p123456-abcdef-tp' once Cloud SQL/DMS tenant project is generated
+
+# GCS Staging Bucket & Backup Object Configuration
+staging_bucket_name           = "prod-dms-mysql80-staging-sg"
+staging_bucket_retention_days = 14
+dms_service_account_email     = "service-123456789012@gcp-sa-datamigration.iam.gserviceaccount.com"
+backup_writer_members         = ["serviceAccount:gce-mysql80-sa@my-gcp-project-01.iam.gserviceaccount.com"]
+backup_object_path            = "backups/mysql80-full.xbstream"
+
+# Destination Cloud SQL Configuration (MYSQL_8_4 default or MYSQL_8_0)
+cloudsql_instance_name       = "cloudsql-mysql-dest-bkp-01"
+target_database_version      = "MYSQL_8_4"
+cloudsql_edition             = "ENTERPRISE_PLUS"
+cloudsql_tier                = "db-perf-optimized-N-8"
+cloudsql_availability_type   = "REGIONAL"
+cloudsql_disk_size_gb        = 1000
+cloudsql_root_password       = "REPLACE_WITH_SECURE_ROOT_PASSWORD"
+cloudsql_deletion_protection = true
+
+# Source GCE MySQL 8.0 VM Configuration (for ongoing Binlog CDC after GCS restore)
+source_gce_mysql_host     = "10.148.0.25"
+source_gce_mysql_port     = 3306
+source_gce_mysql_username = "dms_repl_user"
+source_gce_mysql_password = "REPLACE_WITH_SECURE_REPL_PASSWORD"
+
+# DMS Backup-Seeded Migration + CDC Job Configuration
+migration_job_id    = "gcs-bkp-mysql80-cdc"
+dump_type           = "PHYSICAL" # Use "PHYSICAL" for Percona XtraBackup or "LOGICAL" for mysqldump
+connectivity_method = "VPC_PEERING"
