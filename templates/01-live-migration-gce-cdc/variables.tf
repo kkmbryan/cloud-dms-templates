@@ -128,6 +128,11 @@ variable "cloudsql_instance_name" {
   description = "Name of the destination Cloud SQL for MySQL instance."
   type        = string
   default     = "cloudsql-mysql-dest-live-01"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{0,48}[a-z0-9]$", var.cloudsql_instance_name))
+    error_message = "cloudsql_instance_name must be 2-50 characters: lowercase letters, digits and hyphens, starting with a letter and not ending with a hyphen (the PSC endpoint resource names append up to 13 characters)."
+  }
 }
 
 variable "target_database_version" {
@@ -145,18 +150,33 @@ variable "cloudsql_edition" {
   description = "Cloud SQL edition ('ENTERPRISE_PLUS' default, with Data Cache, or 'ENTERPRISE')."
   type        = string
   default     = "ENTERPRISE_PLUS"
+
+  validation {
+    condition     = contains(["ENTERPRISE_PLUS", "ENTERPRISE"], var.cloudsql_edition)
+    error_message = "cloudsql_edition must be \"ENTERPRISE_PLUS\" or \"ENTERPRISE\"."
+  }
 }
 
 variable "cloudsql_tier" {
   description = "Machine tier for the destination Cloud SQL instance."
   type        = string
   default     = "db-perf-optimized-N-8"
+
+  validation {
+    condition     = !startswith(var.cloudsql_tier, "db-perf-optimized-N-") || var.cloudsql_edition == "ENTERPRISE_PLUS"
+    error_message = "db-perf-optimized-N-* tiers are Enterprise Plus tiers: set cloudsql_edition = \"ENTERPRISE_PLUS\", or use an Enterprise tier such as db-custom-4-16384."
+  }
 }
 
 variable "cloudsql_availability_type" {
   description = "Availability type for the destination Cloud SQL instance ('REGIONAL' for HA or 'ZONAL')."
   type        = string
   default     = "REGIONAL"
+
+  validation {
+    condition     = contains(["REGIONAL", "ZONAL"], var.cloudsql_availability_type)
+    error_message = "cloudsql_availability_type must be \"REGIONAL\" or \"ZONAL\"."
+  }
 }
 
 variable "cloudsql_disk_size_gb" {
@@ -187,6 +207,28 @@ variable "cloudsql_deletion_protection" {
   description = "Whether deletion protection is enabled on the destination Cloud SQL instance."
   type        = bool
   default     = true
+}
+
+variable "cloudsql_transaction_log_retention_days" {
+  description = "Days of binary logs kept for point-in-time recovery: 1-7 for ENTERPRISE, 1-35 for ENTERPRISE_PLUS."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.cloudsql_transaction_log_retention_days >= 1 && var.cloudsql_transaction_log_retention_days <= (var.cloudsql_edition == "ENTERPRISE_PLUS" ? 35 : 7)
+    error_message = "cloudsql_transaction_log_retention_days must be 1-7 for ENTERPRISE and 1-35 for ENTERPRISE_PLUS."
+  }
+}
+
+variable "cloudsql_retained_backups" {
+  description = "Number of automated backups to keep (1-365)."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.cloudsql_retained_backups >= 1 && var.cloudsql_retained_backups <= 365
+    error_message = "cloudsql_retained_backups must be between 1 and 365."
+  }
 }
 
 # PSC consumer endpoint + private DNS (application access after promotion)
@@ -248,6 +290,11 @@ variable "source_gce_mysql_password" {
   description = "Password of the source migration user (32 characters or fewer)."
   type        = string
   sensitive   = true
+
+  validation {
+    condition     = length(var.source_gce_mysql_password) > 0 && length(var.source_gce_mysql_password) <= 32
+    error_message = "source_gce_mysql_password must be 1-32 characters long (Database Migration Service limit)."
+  }
 }
 
 # DMS Live Migration + CDC Job Configuration
@@ -255,6 +302,11 @@ variable "migration_job_id" {
   description = "Identifier for the live continuous DMS migration job."
   type        = string
   default     = "gce-live-mysql80-cdc"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{0,54}[a-z0-9]$", var.migration_job_id))
+    error_message = "migration_job_id must be 2-56 characters: lowercase letters, digits and hyphens, starting with a letter and not ending with a hyphen (the connection profile IDs append -src and -dest)."
+  }
 }
 
 variable "dump_parallel_level" {
@@ -266,6 +318,21 @@ variable "dump_parallel_level" {
     condition     = contains(["MIN", "OPTIMAL", "MAX"], var.dump_parallel_level)
     error_message = "dump_parallel_level must be one of \"MIN\", \"OPTIMAL\" or \"MAX\"."
   }
+}
+
+variable "migration_databases" {
+  description = "Optional list of source databases to migrate (selective migration, like gcloud --databases-filter). Empty (default) = all user databases."
+  type        = list(string)
+  default     = []
+}
+
+variable "dump_flags" {
+  description = "Optional mysqldump flags for the DMS-managed dump, as name/value pairs (for example [{ name = \"max-allowed-packet\", value = \"1G\" }])."
+  type = list(object({
+    name  = string
+    value = string
+  }))
+  default = []
 }
 
 variable "connectivity_method" {

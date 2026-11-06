@@ -12,7 +12,7 @@ Thank you for your interest in improving these templates. This guide explains ho
 | Terraform | `>= 1.11` (the root password uses a write-only argument) | `make fmt-check validate` |
 | Google provider (`hashicorp/google`) | `>= 8.0, < 9.0` (pinned in each `versions.tf` and the template lock files) | `terraform init` |
 | Google Cloud CLI (`gcloud`) | Current release | The `local-exec` steps and the `Makefile` targets |
-| [pre-commit](https://pre-commit.com/) | Current release | Hooks in `.pre-commit-config.yaml` (fmt, validate, tflint, checkov, private key detection) |
+| [pre-commit](https://pre-commit.com/) | Current release | Hooks in `.pre-commit-config.yaml` (fmt, validate, tflint, trivy, gitleaks, ShellCheck, zh-CN parity, customer-safety check, `terraform test`) |
 | [TFLint](https://github.com/terraform-linters/tflint) | Current release | `make lint` with `.tflint.hcl` |
 | [ShellCheck](https://www.shellcheck.net/) | Current release | Bash scripts in `scripts/` and `templates/*/scripts/` |
 
@@ -29,7 +29,10 @@ Run these from the repository root before you open a pull request. CI runs `terr
 
 ```bash
 make fmt-check validate
+make test                                # terraform test with a mock provider
 make lint
+python3 scripts/ci/zh_parity_check.py    # EN and zh-CN docs stay in sync
+bash scripts/ci/customer_safety_check.sh # no state files, tenant IDs or project numbers
 pre-commit run -a
 shellcheck scripts/source-prep/*.sh templates/*/scripts/*.sh
 ```

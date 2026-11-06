@@ -18,6 +18,11 @@ variable "source_display_name" {
   description = "Display name for the source GCE MySQL 8.0 connection profile."
   type        = string
   default     = "GCE MySQL 80 Source"
+
+  validation {
+    condition     = !can(regex("[._()]", var.source_display_name))
+    error_message = "source_display_name can't contain '.', '_', '(' or ')' (rejected by Database Migration Service)."
+  }
 }
 
 variable "source_host" {
@@ -87,6 +92,11 @@ variable "destination_display_name" {
   description = "Display name for the destination Cloud SQL for MySQL connection profile."
   type        = string
   default     = "Cloud SQL MySQL Destination"
+
+  validation {
+    condition     = !can(regex("[._()]", var.destination_display_name))
+    error_message = "destination_display_name can't contain '.', '_', '(' or ')' (rejected by Database Migration Service)."
+  }
 }
 
 variable "destination_mode" {

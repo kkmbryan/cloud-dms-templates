@@ -1,5 +1,9 @@
 name: Terraform CI - Cloud DMS Templates
 
+# All third-party actions are pinned to a full commit SHA (tag in the comment).
+# Scanner binaries (trivy, gitleaks) are downloaded from their GitHub releases
+# at a pinned version and verified against the release checksums file.
+
 on:
   push:
     branches:
@@ -7,37 +11,241 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: terraform-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TF_VERSION: "1.11.4"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "0"
+  TFLINT_VERSION: "v0.65.0"
+  TRIVY_VERSION: "0.76.2"
+  GITLEAKS_VERSION: "8.30.1"
+
 jobs:
-  terraform-validate:
-    name: Validate Terraform Modules & Templates
+  # ----------------------------------------------------------------------------
+  # terraform fmt over the whole repository (modules, templates, examples, tests)
+  # ----------------------------------------------------------------------------
+  fmt:
+    name: terraform fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive -diff
+
+  # ----------------------------------------------------------------------------
+  # init -backend=false + validate per root against the minimum (8.0.0) and the
+  # newest 8.x google provider. Runs in a temporary copy of the repository, so
+  # the committed .terraform.lock.hcl files are never modified. The mocked
+  # terraform tests also run against each provider version.
+  # ----------------------------------------------------------------------------
+  validate:
+    name: validate (${{ matrix.root }}, google ${{ matrix.provider }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        template:
+        root:
           - templates/01-live-migration-gce-cdc
           - templates/02-backup-migration-gcs-cdc
-
+          - examples/multi-database
+        provider:
+          - "8.0.0"
+          - latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
-          terraform_version: "1.11.4"
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
 
-      - name: Terraform Format Check
-        run: terraform fmt -check -recursive
+      - name: init + validate (+ test) with google ${{ matrix.provider }}
+        env:
+          RUN_TESTS: "1"
+        run: scripts/ci/provider_matrix.sh "${{ matrix.root }}" "${{ matrix.provider }}"
 
-      - name: Terraform Init (No Backend)
-        working-directory: ${{ matrix.template }}
-        run: terraform init -backend=false -input=false
+  # ----------------------------------------------------------------------------
+  # terraform test (mock_provider, command = plan) with the committed lock file.
+  # -lockfile=readonly also fails when a lock file is out of date.
+  # ----------------------------------------------------------------------------
+  test:
+    name: terraform test (${{ matrix.root }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        root:
+          - templates/01-live-migration-gce-cdc
+          - templates/02-backup-migration-gcs-cdc
+          - examples/multi-database
+    defaults:
+      run:
+        working-directory: ${{ matrix.root }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Terraform Validate
-        working-directory: ${{ matrix.template }}
-        run: terraform validate
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init (locked providers, no backend)
+        run: terraform init -backend=false -lockfile=readonly
+
+      - name: terraform test
+        run: terraform test
+
+  # ----------------------------------------------------------------------------
+  # TFLint with the terraform (recommended preset) and google rulesets, over
+  # every root and module (--recursive, call_module_type = all).
+  # ----------------------------------------------------------------------------
+  tflint:
+    name: tflint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+          cache: true
+
+      - name: tflint --init
+        env:
+          # Avoids GitHub API rate limits when downloading the google ruleset.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: tflint --init --config="${GITHUB_WORKSPACE}/.tflint.hcl"
+
+      - name: tflint --recursive
+        run: tflint --recursive --config="${GITHUB_WORKSPACE}/.tflint.hcl" --format=compact
+
+  # ----------------------------------------------------------------------------
+  # Trivy IaC misconfiguration scan. Results go to GitHub code scanning (SARIF);
+  # the job fails on any finding not accepted in .trivyignore.
+  # ----------------------------------------------------------------------------
+  trivy:
+    name: trivy config scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install trivy ${{ env.TRIVY_VERSION }} (checksum verified)
+        run: |
+          set -euo pipefail
+          base="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          tarball="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          cd "${RUNNER_TEMP}"
+          curl -sSfLO "${base}/${tarball}"
+          curl -sSfLO "${base}/trivy_${TRIVY_VERSION}_checksums.txt"
+          grep " ${tarball}\$" "trivy_${TRIVY_VERSION}_checksums.txt" | sha256sum -c -
+          mkdir -p bin && tar -xzf "${tarball}" -C bin trivy
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: trivy config (SARIF)
+        run: |
+          trivy config --quiet --ignorefile .trivyignore --skip-dirs '**/.terraform' \
+            --format sarif --output trivy-config.sarif --exit-code 0 .
+
+      - name: Upload SARIF to code scanning
+        # Fork pull requests get a read-only token; skip the upload there.
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+
+      - name: trivy config (fail on findings)
+        run: |
+          trivy config --quiet --ignorefile .trivyignore --skip-dirs '**/.terraform' \
+            --format table --exit-code 1 .
+
+  # ----------------------------------------------------------------------------
+  # Gitleaks over the full git history and the working tree. .gitleaks.toml
+  # extends the default rules and allow-lists documented placeholders only.
+  # ----------------------------------------------------------------------------
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks ${{ env.GITLEAKS_VERSION }} (checksum verified)
+        run: |
+          set -euo pipefail
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          cd "${RUNNER_TEMP}"
+          curl -sSfLO "${base}/${tarball}"
+          curl -sSfLO "${base}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          grep " ${tarball}\$" "gitleaks_${GITLEAKS_VERSION}_checksums.txt" | sha256sum -c -
+          mkdir -p bin && tar -xzf "${tarball}" -C bin gitleaks
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+
+      - name: gitleaks git (history)
+        run: gitleaks git --no-banner --redact --verbose --config .gitleaks.toml .
+
+      - name: gitleaks dir (working tree)
+        run: gitleaks dir --no-banner --redact --verbose --config .gitleaks.toml .
+
+  # ----------------------------------------------------------------------------
+  # Repository hygiene: EN <-> zh-CN doc parity, customer-safety check and
+  # shellcheck of the repository scripts.
+  # ----------------------------------------------------------------------------
+  repo-checks:
+    name: docs parity, customer safety, shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: EN <-> zh-CN Markdown parity
+        run: python3 scripts/ci/zh_parity_check.py
+
+      - name: Customer-safety check
+        run: bash scripts/ci/customer_safety_check.sh
+
+      - name: shellcheck
+        run: |
+          git ls-files -z '*.sh' | xargs -0 shellcheck --severity=warning

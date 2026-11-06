@@ -72,7 +72,11 @@ flowchart LR
   - **`LOGICAL`（默认 — `mysqldump`）：** 上传到暂存存储桶的单个压缩 mysqldump 文件。`dump_path` 指向该文件。适用于 `MYSQL_8_0` 和 `MYSQL_8_4` 目标。
   - **`PHYSICAL`（Percona XtraBackup）：** 经过**准备**（先 `xtrabackup --backup`，再 `--prepare`）并上传到存储桶中**专用文件夹**的完整备份。`dump_path` 指向该文件夹。**仅支持 `MYSQL_8_0` 目标。** 请使用 [`scripts/xtrabackup_to_gcs.sh`](templates/02-backup-migration-gcs-cdc/scripts/xtrabackup_to_gcs.sh)。
 - **自动配置存储桶 IAM：** Terraform 会在存储桶上为 DMS 服务代理和 Cloud SQL 实例服务账号授予 `roles/storage.objectViewer` 与 `roles/storage.legacyBucketReader`，并为 `backup_writer_members` 授予 `roles/storage.objectCreator` + `roles/storage.objectViewer`。 在 `DMS_MANAGED_CLOUDSQL` 模式下，实例由 DMS 在 apply 之后创建，因此请在 `verify` 之前自行为其服务账号授予这两个读取角色：`gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer`（再使用 `roles/storage.legacyBucketReader` 重复执行一次）。
-- **Terraform Provider 互斥防护：** 在 `google_database_migration_service_migration_job` 中，`dump_path` 与 `dump_flags` 互斥。设置 `dump_path`（场景 2）时，`modules/dms-migration-job` 会省略 `dump_flags` 和 `performance_config`。
+- **Terraform Provider 互斥防护：** 在 `google_database_migration_service_migration_job` 中，`dump_path` 与 `dump_flags` 互斥。设置 `dump_path`（场景 2）时，`modules/dms-migration-job` 会省略 `performance_config`，并拒绝 `dump_flags` 和选择性迁移（`databases`）。
+
+### 多个数据库或实例（`examples/multi-database`）
+- **适用场景：** 多个源数据库或服务器迁移到多个 Cloud SQL 实例（DMS 为每个目标实例运行一个迁移作业）。
+- **工作流程：** `migrations` 映射中的每个条目对应一个作业。所有条目共享一个 Network Attachment（`ACCEPT_MANUAL`，接受列表包含所有实例的租户项目）、一条防火墙规则和一个私有 DNS 区域；每个条目各自拥有实例、PSC 端点和 DNS 记录。`databases`（选择性迁移）可将一个源服务器拆分到多个实例。请参阅 [examples/multi-database/README.zh-CN.md](examples/multi-database/README.zh-CN.md)。
 
 ### 支持矩阵
 
@@ -152,10 +156,14 @@ cloud-dms-templates/
 ├── modules/
 │   ├── networking-psc/                   # PSC Network Attachment (ACCEPT_MANUAL) + source firewall rule (or PSA peering)
 │   ├── gcs-migration-staging/            # Staging bucket + reader/writer IAM
-│   ├── cloudsql-mysql-destination/       # Cloud SQL MySQL 8.0 / 8.4 target + PSC interface
+│   ├── cloudsql-mysql-destination/       # Cloud SQL MySQL 8.0 / 8.4 target (PSC, no public IP)
+│   ├── cloudsql-psc-outbound/            # Attach/detach the Network Attachment (PSC interface) via gcloud
 │   ├── cloudsql-psc-endpoint/            # PSC consumer endpoint + private DNS for applications
 │   ├── dms-connection-profiles/          # Source and destination DMS connection profiles
 │   └── dms-migration-job/                # Continuous DMS migration job + demote step
+├── examples/
+│   └── multi-database/                   # Several jobs/instances sharing one Network Attachment and DNS zone
+├── scripts/ci/                           # CI helpers: zh-CN parity, generic customer-safety check
 └── templates/
     ├── 01-live-migration-gce-cdc/        # Root Template 1: DMS-managed dump + CDC
     │   ├── .terraform.lock.hcl
@@ -180,7 +188,9 @@ cloud-dms-templates/
 ### 在本地验证所有模板
 ```bash
 make fmt-check
-make validate
+make validate   # templates and examples/multi-database
+make test       # terraform test with a mock provider (no cloud calls)
+make lint       # tflint, if installed
 ```
 
 ### 部署场景 1（在线迁移 + CDC）
@@ -224,23 +234,29 @@ terraform apply tfplan
 ```
 
 ### 第 2 天：DMS 作业验证、监控与切换提升
+DMS 相关目标需要 `PROJECT_ID`。`JOB_ID` 和 `CLOUDSQL_INSTANCE` 默认取自 `TF_DIR`（默认 `templates/01-live-migration-gce-cdc`）的 Terraform 输出；对于 `examples/multi-database`，请显式设置它们。
 ```bash
-# Scenario 1 job ID: gce-live-mysql80-cdc. Scenario 2 job ID: gcs-bkp-mysql80-cdc.
+export PROJECT_ID=my-gcp-project-01
 # Verify source/destination connectivity, GTID/binlog settings and (Scenario 2) bucket access
-make verify-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
+make verify-job PROJECT_ID=$PROJECT_ID                       # Scenario 1 (TF_DIR default)
+make verify-job PROJECT_ID=$PROJECT_ID TF_DIR=templates/02-backup-migration-gcs-cdc
 
-# Start the migration job
-make start-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
+# Start, then watch state/phase (FULL_DUMP -> CDC) and replication lag (DMS metric
+# max_replica_sec_lag, falling back to the destination's Cloud SQL replica_lag)
+make start-job  PROJECT_ID=$PROJECT_ID
+make status-job PROJECT_ID=$PROJECT_ID
+make lag        PROJECT_ID=$PROJECT_ID LAG_MINUTES=30
 
-# Monitor the job state and phase (FULL_DUMP -> CDC). Replication lag is in Cloud Monitoring:
-# datamigration.googleapis.com/migration_job/max_replica_sec_lag; make lag falls back to the
-# destination's cloudsql.googleapis.com/database/replication/replica_lag when CLOUDSQL_INSTANCE is set
-make status-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
-make lag PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc LAG_MINUTES=30 CLOUDSQL_INSTANCE=<cloudsql_instance_name>
+# Pause and continue CDC, or start over (restart re-dumps the data)
+make stop-job   PROJECT_ID=$PROJECT_ID
+make resume-job PROJECT_ID=$PROJECT_ID
 
-# Promote the Cloud SQL destination during the cutover window
-make promote-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
+# Guarded promote: the job must be RUNNING in CDC with lag <= MAX_LAG_SECONDS (default 10),
+# then you type the job ID to confirm (CONFIRM=yes skips the prompt in automation)
+make promote-job PROJECT_ID=$PROJECT_ID MAX_LAG_SECONDS=5
 ```
+
+`make demote-destination` 仅用于手动恢复；`terraform apply` 已经对目标实例执行过一次降级。
 
 提升之前，请完成运维手册第 8 节中的 Go / No-Go 检查清单和回退决策。提升之后，应用连接到 `terraform output -raw psc_endpoint_dns_name`（即实例 DNS 名称，由私有区域解析为 PSC 端点 IP），并使用 TLS；然后运行 `terraform plan`/`apply`（运维手册第 9.1 节）。如需下线迁移对象并保留 Cloud SQL，请设置 `migration_enabled = false` 并执行 apply（运维手册第 10.2 节；分离 Network Attachment 会重启实例）。
 

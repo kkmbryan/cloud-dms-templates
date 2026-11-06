@@ -42,6 +42,8 @@ cloudsql_disk_size_gb        = 500
 cloudsql_root_password       = "REPLACE_WITH_SECURE_ROOT_PASSWORD"
 cloudsql_deletion_protection = true
 cloudsql_ssl_mode            = "ENCRYPTED_ONLY"
+# cloudsql_transaction_log_retention_days = 7  # 1-7 ENTERPRISE, 1-35 ENTERPRISE_PLUS
+# cloudsql_retained_backups               = 30 # 1-365
 # cloudsql_kms_key_name = "projects/my-gcp-project-01/locations/europe-west2/keyRings/dms/cryptoKeys/cloudsql" # CMEK, set at creation only
 # cloudsql_password_validation_policy = { min_length = 14 } # enable after promotion, not at creation
 # cloudsql_lower_case_table_names = 1 # IMMUTABLE: set only if the source uses 1 (SELECT @@lower_case_table_names)
@@ -59,6 +61,8 @@ source_ssl_type = "REQUIRED"
 # DMS live migration + CDC job
 migration_job_id    = "gce-live-mysql80-cdc"
 dump_parallel_level = "OPTIMAL"
+# migration_databases = ["app_db1", "app_db2"] # selective migration; empty = all databases
+# dump_flags = [{ name = "max-allowed-packet", value = "1G" }]
 
 # After promotion: set to false to retire the DMS job, profiles, Network
 # Attachment (restarts the instance) and firewall rule; Cloud SQL, the PSC

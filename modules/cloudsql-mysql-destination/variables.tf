@@ -75,18 +75,6 @@ variable "allowed_psc_projects" {
   default     = []
 }
 
-variable "psc_outbound_enabled" {
-  description = "Whether to attach psc_network_attachment_uri to the instance (PSC outbound / PSC interface) so that DMS replication can reach the source VPC."
-  type        = bool
-  default     = false
-}
-
-variable "psc_network_attachment_uri" {
-  description = "The URI of the Compute Engine Network Attachment (PSCI) used by the Cloud SQL instance for Private Service Connect outbound connections to the source VPC."
-  type        = string
-  default     = null
-}
-
 variable "private_network" {
   description = "The VPC self_link or ID used for Private Services Access (PSA) when connectivity_type is PSA."
   type        = string
@@ -181,9 +169,14 @@ variable "binary_log_enabled" {
 }
 
 variable "transaction_log_retention_days" {
-  description = "Number of days to retain binary transaction logs for PITR (1 to 7)."
+  description = "Number of days to retain binary transaction logs for PITR (1-7 for ENTERPRISE, 1-35 for ENTERPRISE_PLUS)."
   type        = number
   default     = 7
+
+  validation {
+    condition     = var.transaction_log_retention_days >= 1 && var.transaction_log_retention_days <= (var.edition == "ENTERPRISE_PLUS" ? 35 : 7)
+    error_message = "transaction_log_retention_days must be 1-7 for ENTERPRISE and 1-35 for ENTERPRISE_PLUS."
+  }
 }
 
 variable "retained_backups" {
@@ -226,14 +219,3 @@ variable "password_validation_policy" {
   default = null
 }
 
-variable "operation_timeout_seconds" {
-  description = "Maximum time in seconds to wait for each Cloud SQL patch operation run by the local-exec steps (attach and detach the Network Attachment)."
-  type        = number
-  default     = 1800
-}
-
-variable "impersonate_service_account" {
-  description = "Optional service account that the gcloud local-exec steps impersonate (exported as CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT). Set it to the provider's impersonate_service_account so that Terraform and gcloud use the same identity."
-  type        = string
-  default     = null
-}

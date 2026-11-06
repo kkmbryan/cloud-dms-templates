@@ -67,6 +67,40 @@ This matrix is the single source of the scenario guidance; the [README](../READM
    ```
 3. **Authentication plugins:** in MySQL 8.4, `caching_sha2_password` is the default authentication plugin, and `mysql_native_password` is disabled by default (it's removed in MySQL 9.0). On Cloud SQL, the `default_authentication_plugin` flag is supported in MySQL 8.0 only. Before cutover, recreate application accounts with `caching_sha2_password` (section 5) and confirm that every client driver and connector supports it. Sources: [caching_sha2_password](https://dev.mysql.com/doc/refman/8.4/en/caching-sha2-pluggable-authentication.html), [Native Pluggable Authentication](https://dev.mysql.com/doc/refman/8.4/en/native-pluggable-authentication.html), [Configure database flags](https://cloud.google.com/sql/docs/mysql/flags).
 
+### 1.3 Destination Mode and Connectivity Matrix
+
+| Setting | `EXISTING_CLOUDSQL` + `PSC` (default) | `EXISTING_CLOUDSQL` + `PSA` | `DMS_MANAGED_CLOUDSQL` |
+| :--- | :--- | :--- | :--- |
+| **Who creates Cloud SQL** | Terraform (`modules/cloudsql-mysql-destination`) | Terraform | DMS, from the destination connection profile |
+| **DMS → source path** | PSC interface: Network Attachment (`ACCEPT_MANUAL`) attached to the instance | Private Services Access peering (`create_psa_peering` or an existing peering) | `connectivity_method`: `VPC_PEERING`, `REVERSE_SSH` or `STATIC_IP` |
+| **Source firewall rule** | Created from the Network Attachment subnet | Not created; allow the PSA range yourself | Not created |
+| **Application access** | PSC endpoint + private DNS record (created) | Private IP in the peered range | Depends on the profile's IP settings |
+| **Public IP** | None | None | Depends on DMS; incompatible with `sql.restrictPublicIp` when DMS needs it |
+| **`migration_enabled = false`** | Supported | Supported | Rejected (validation) |
+| **Live-tested** | Yes (TESTING.md) | No (plan only) | No (plan only) |
+
+### 1.4 Cost Guidance
+
+- **DMS:** no additional charge for native MySQL migrations or replication to Cloud SQL for MySQL ([Database Migration Service pricing](https://cloud.google.com/database-migration/pricing)).
+- **What you pay for:** the Cloud SQL instances (from creation, including while they are demoted replicas), their storage and backups; Cloud Storage for the Scenario 2 seed; the PSC endpoint forwarding rule; Cloud DNS; firewall rule logging; and network egress across regions, if any.
+- **Keep it short:** create the destination close to the start of the migration, retire the migration objects with `migration_enabled = false` after cutover, delete the seed after promotion, and right-size the instance after cutover.
+- **Proof of concept profile:** for a rehearsal on a copy of the data, a smaller instance keeps the cost down, for example:
+  ```hcl
+  cloudsql_edition             = "ENTERPRISE"
+  cloudsql_tier                = "db-custom-2-7680"
+  cloudsql_availability_type   = "ZONAL"
+  cloudsql_disk_size_gb        = 20
+  cloudsql_deletion_protection = false
+  ```
+  Size production for the full data set and the CDC write rate instead (section 1.5).
+
+### 1.5 Dump Performance and Sizing
+
+- **Dump parallelism:** `dump_parallel_level = "OPTIMAL"` (default) balances speed and source load; `MAX` is the fastest and loads the source most; `MIN` uses the fewest source resources ([Create a migration job](https://cloud.google.com/database-migration/docs/mysql/create-migration-job-existing-instance)).
+- **Brief global lock:** at the start of the DMS-managed dump, DMS briefly locks the source for writes. The DMS documentation gives about 1 second for 100 tables, 9 seconds for 10,000 tables and 49 seconds for 50,000 tables ([Known limitations](https://cloud.google.com/database-migration/docs/mysql/known-limitations)). Start the job outside peak hours, and check `SHOW PROCESSLIST` for long-running transactions first, because the lock waits for them.
+- **Destination sizing:** give the destination at least the source's vCPU and memory during the migration, so the load and CDC keep up, and enough disk for the data plus binary logs (`disk_autoresize` is on). Watch `make lag`; if lag keeps growing during CDC, scale the destination up before cutover. Right-size after cutover.
+- **Selective migration:** `migration_databases` (template 01) migrates only the listed databases. Use it to split one source server across several instances (`examples/multi-database`).
+
 ---
 
 ## 2. Phase 1: Source MySQL 8.0 Pre-Flight Verification
@@ -537,3 +571,27 @@ flowchart LR
    # After the import into the long-lived stack succeeds:
    shred -u pre-decommission.tfstate 2>/dev/null || rm -P pre-decommission.tfstate   # Linux: shred; macOS: rm -P
    ```
+
+---
+
+## 11. Troubleshooting Reference
+
+Symptoms seen in the live tests (TESTING.md) and in the DMS documentation. Section 6.1 covers `verify` and the Network Attachment in more detail.
+
+| Phase | Symptom | Cause | Fix |
+| :--- | :--- | :--- | :--- |
+| Plan | `Error: Invalid value for variable` on `subnet` / `network_attachment_subnet` | A bare subnet name instead of a full path | Use `projects/PROJECT/regions/REGION/subnetworks/SUBNET` |
+| Plan | `Resource precondition failed` on the firewall rule | Both or neither of `source_target_tags` and `source_target_service_accounts` | Set exactly one, or `create_source_firewall_rule = false` |
+| Plan | `db-perf-optimized-N-* tiers are Enterprise Plus tiers` | Tier and edition don't match | Set `cloudsql_edition = "ENTERPRISE_PLUS"` or use an Enterprise tier |
+| Apply | `Root user's password is not policy compliant` | `cloudsql_password_validation_policy` set at creation | Enable it after promotion (section 9.1) |
+| Apply | `[ERROR_NETWORK_ATTACHMENT_POLICY_FORBIDDEN]` in the attach step | `ACCEPT_MANUAL` accept list without the Cloud SQL tenant project | Leave `psc_producer_accept_list` empty (derived) and apply again |
+| Apply (Scenario 2) | `The supplied dump file doesn't exist` | Job created before the seed was uploaded | Two-phase apply: `create_migration_job = false`, upload, apply again |
+| Apply | `Backups cannot be enabled for read replica instance` | Full apply on a demoted destination (DMS changed its backup settings) | Don't apply the instance until promotion; target only the firewall rule (section 6) |
+| Verify | `Failure connecting to the source database ...` | No firewall path from the Network Attachment subnet to `tcp:3306`, wrong host, or `bind_address` on loopback | Firewall rule, `make preflight` (`bind_address`) |
+| Verify | TLS errors, or `make preflight` WARN `tls` | Source doesn't offer TLS while `source_ssl_type = "REQUIRED"`, or wrong CA for `SERVER_ONLY` | Configure TLS on the source or provide the right CA |
+| Verify / start | `Definer is not supported` | A DEFINER user (for example `root@localhost`) doesn't exist on Cloud SQL | Create the users first or change the DEFINER (section 5) |
+| CDC | `make lag` shows no DMS metric | `migration_job/*` metrics can be empty | `make lag` falls back to the destination's `replica_lag` (`CLOUDSQL_INSTANCE`) |
+| Promote | `make promote-job` stops with `lag above MAX_LAG_SECONDS` | Writes still running on the source | Stop writes (section 8.3) and retry |
+| Retire | Short outage on the PSC endpoint | Detaching the Network Attachment restarts the instance (about 3 minutes per the documentation) | Maintenance window (section 10.2) |
+| Abandon | Destination stays `READ_REPLICA_INSTANCE`; `<instance>-master` remains | Job deleted before promotion | `gcloud sql instances promote-replica` or delete; delete `<instance>-master` (section 10) |
+
