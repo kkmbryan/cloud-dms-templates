@@ -38,30 +38,41 @@ module "networking" {
 module "cloudsql_destination" {
   source = "../../modules/cloudsql-mysql-destination"
 
-  enabled                     = var.destination_mode == "EXISTING_CLOUDSQL"
+  enabled                        = var.destination_mode == "EXISTING_CLOUDSQL"
+  project_id                     = var.project_id
+  region                         = var.region
+  instance_name                  = var.cloudsql_instance_name
+  database_version               = var.target_database_version
+  edition                        = var.cloudsql_edition
+  tier                           = var.cloudsql_tier
+  availability_type              = var.cloudsql_availability_type
+  connectivity_type              = var.connectivity_type
+  enable_ipv4                    = false
+  allowed_psc_projects           = distinct(concat([var.project_id], var.allowed_psc_consumer_projects))
+  private_network                = module.networking.psa_private_network_link
+  disk_size_gb                   = var.cloudsql_disk_size_gb
+  root_password                  = var.cloudsql_root_password
+  root_password_wo_version       = var.cloudsql_root_password_version
+  lower_case_table_names         = var.cloudsql_lower_case_table_names
+  transaction_log_retention_days = var.cloudsql_transaction_log_retention_days
+  retained_backups               = var.cloudsql_retained_backups
+  deletion_protection            = var.cloudsql_deletion_protection
+  ssl_mode                       = var.cloudsql_ssl_mode
+  kms_key_name                   = var.cloudsql_kms_key_name
+  password_validation_policy     = var.cloudsql_password_validation_policy
+  labels                         = var.labels
+}
+
+# Attach the Network Attachment to the instance (PSC interface) while the
+# migration runs; detached again (instance restart) when migration_enabled = false.
+module "cloudsql_psc_outbound" {
+  source = "../../modules/cloudsql-psc-outbound"
+
+  enabled                     = var.destination_mode == "EXISTING_CLOUDSQL" && var.connectivity_type == "PSC" && var.migration_enabled
   project_id                  = var.project_id
-  region                      = var.region
-  instance_name               = var.cloudsql_instance_name
-  database_version            = var.target_database_version
-  edition                     = var.cloudsql_edition
-  tier                        = var.cloudsql_tier
-  availability_type           = var.cloudsql_availability_type
-  connectivity_type           = var.connectivity_type
-  enable_ipv4                 = false
-  allowed_psc_projects        = distinct(concat([var.project_id], var.allowed_psc_consumer_projects))
-  psc_outbound_enabled        = var.connectivity_type == "PSC" && var.migration_enabled
-  psc_network_attachment_uri  = module.networking.network_attachment_self_link
-  private_network             = module.networking.psa_private_network_link
-  disk_size_gb                = var.cloudsql_disk_size_gb
-  root_password               = var.cloudsql_root_password
-  root_password_wo_version    = var.cloudsql_root_password_version
-  lower_case_table_names      = var.cloudsql_lower_case_table_names
-  deletion_protection         = var.cloudsql_deletion_protection
-  ssl_mode                    = var.cloudsql_ssl_mode
-  kms_key_name                = var.cloudsql_kms_key_name
-  password_validation_policy  = var.cloudsql_password_validation_policy
+  instance_name               = module.cloudsql_destination.instance_name
+  network_attachment_uri      = module.networking.network_attachment_self_link
   impersonate_service_account = var.impersonate_service_account
-  labels                      = var.labels
 }
 
 # 3. PSC consumer endpoint + private DNS so applications can reach the
@@ -106,7 +117,7 @@ module "dms_connection_profiles" {
   destination_profile_id   = var.destination_mode == "DMS_MANAGED_CLOUDSQL" ? var.cloudsql_instance_name : "${var.migration_job_id}-dest"
   destination_display_name = "Cloud SQL ${replace(var.target_database_version, "_", " ")} destination live CDC"
   destination_mode         = var.destination_mode
-  destination_cloud_sql_id = var.destination_mode == "EXISTING_CLOUDSQL" ? module.cloudsql_destination.instance_name : ""
+  destination_cloud_sql_id = var.destination_mode == "EXISTING_CLOUDSQL" ? module.cloudsql_psc_outbound.instance_name : ""
 
   dest_database_version = var.target_database_version
   dest_edition          = var.cloudsql_edition
@@ -136,6 +147,8 @@ module "dms_migration_job" {
   dump_type                      = "LOGICAL"
   dump_path                      = null
   dump_parallel_level            = var.dump_parallel_level
+  dump_flags                     = var.dump_flags
+  databases                      = var.migration_databases
   connectivity_method            = var.connectivity_method
   vpc_peering_network            = var.network
   reverse_ssh_vm_ip              = var.reverse_ssh_vm_ip
@@ -154,4 +167,10 @@ moved {
 moved {
   from = module.dms_migration_job
   to   = module.dms_migration_job[0]
+}
+
+# The attach step moved from the destination module to its own module.
+moved {
+  from = module.cloudsql_destination.terraform_data.psc_outbound_network_attachment
+  to   = module.cloudsql_psc_outbound.terraform_data.psc_outbound_network_attachment
 }

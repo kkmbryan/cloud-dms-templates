@@ -18,6 +18,11 @@ variable "display_name" {
   description = "Human-readable display name for the DMS migration job."
   type        = string
   default     = "GCE MySQL 80 to Cloud SQL Continuous CDC Migration"
+
+  validation {
+    condition     = !can(regex("[._()]", var.display_name))
+    error_message = "display_name can't contain '.', '_', '(' or ')' (rejected by Database Migration Service)."
+  }
 }
 
 variable "migration_type" {
@@ -81,12 +86,23 @@ variable "dump_parallel_level" {
 }
 
 variable "dump_flags" {
-  description = "Optional list of custom dump flags (name/value pairs) for DMS-managed logical dumps. Ignored when dump_path is set (mutually exclusive in Google Provider schema)."
+  description = "Optional list of custom dump flags (name/value pairs) for DMS-managed logical dumps. Rejected when dump_path is set (mutually exclusive in the provider schema)."
   type = list(object({
     name  = string
     value = string
   }))
   default = []
+}
+
+variable "databases" {
+  description = "Optional list of source databases to migrate (selective migration, the API equivalent of gcloud --databases-filter). Empty = all databases. DMS-managed dump only (no dump_path)."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for d in var.databases : can(regex("^[A-Za-z0-9_$-]{1,64}$", d))])
+    error_message = "Each database name must be 1-64 characters of letters, digits, '_', '$' or '-'."
+  }
 }
 
 variable "connectivity_method" {

@@ -21,8 +21,9 @@ For changes to deployed resources, paste a REDACTED plan summary: resource addre
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md).
 
-- [ ] `make fmt-check validate` passes.
-- [ ] `make lint` and `pre-commit run -a` pass, with no new TFLint or Checkov findings (or each inline `checkov:skip` gives a reason).
+- [ ] `make fmt-check validate test` passes.
+- [ ] `python3 scripts/ci/zh_parity_check.py` and `bash scripts/ci/customer_safety_check.sh` pass.
+- [ ] `make lint` and `pre-commit run -a` pass, with no new TFLint, Trivy or gitleaks findings (each accepted finding is documented in `.trivyignore`).
 - [ ] Changed shell scripts are ShellCheck-clean.
 - [ ] Every changed Mermaid block renders on GitHub.
 - [ ] Every changed English document has its `*.zh-CN.md` counterpart updated in this pull request, and both stay structurally in sync (headings, tables, alerts, links; code blocks byte-identical).

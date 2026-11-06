@@ -1,0 +1,11 @@
+# Trivy misconfiguration scan: accepted findings.
+# Every entry needs a reason. Review them when the modules change.
+# Scan: trivy config --ignorefile .trivyignore .
+
+# GCP-0066 (LOW) Storage bucket encryption does not use a customer-managed key.
+# modules/gcs-migration-staging: CMEK is optional on purpose. Set
+# staging_bucket_kms_key_name (Scenario 2) to use a Cloud KMS key; the default
+# is Google-managed encryption, which is acceptable for a short-lived staging
+# bucket that also has public access prevention, uniform bucket-level access,
+# versioning and a delete lifecycle.
+GCP-0066

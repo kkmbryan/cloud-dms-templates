@@ -12,7 +12,7 @@ Thank you for your interest in improving these templates. This guide explains ho
 | Terraform | `>= 1.11` (the root password uses a write-only argument) | `make fmt-check validate` |
 | Google provider (`hashicorp/google`) | `>= 8.0, < 9.0` (pinned in each `versions.tf` and the template lock files) | `terraform init` |
 | Google Cloud CLI (`gcloud`) | Current release | The `local-exec` steps and the `Makefile` targets |
-| [pre-commit](https://pre-commit.com/) | Current release | Hooks in `.pre-commit-config.yaml` (fmt, validate, tflint, checkov, private key detection) |
+| [pre-commit](https://pre-commit.com/) | Current release | Hooks in `.pre-commit-config.yaml` (fmt, validate, tflint, trivy, gitleaks, ShellCheck, zh-CN parity, customer-safety check, `terraform test`) |
 | [TFLint](https://github.com/terraform-linters/tflint) | Current release | `make lint` with `.tflint.hcl` |
 | [ShellCheck](https://www.shellcheck.net/) | Current release | Bash scripts in `scripts/` and `templates/*/scripts/` |
 
@@ -21,20 +21,23 @@ pip install pre-commit
 pre-commit install
 ```
 
-Don't change the provider constraint or the committed `.terraform.lock.hcl` files of the templates unless that is the purpose of your pull request. If you do, run `terraform init -upgrade` in both templates and commit both lock files.
+Don't change the provider constraint or the committed `.terraform.lock.hcl` files of the templates unless that is the purpose of your pull request. If you do, run `terraform init -upgrade` in all three roots (both templates and `examples/multi-database`) and commit their lock files.
 
 ## 2. Checks Every Pull Request Must Pass
 
-Run these from the repository root before you open a pull request. CI runs `terraform fmt -check` and `terraform validate` on both templates.
+Run these from the repository root before you open a pull request. CI runs `terraform fmt -check`, `terraform validate` (google 8.0.0 and the latest 8.x) and `terraform test` on all three roots, plus tflint, trivy, gitleaks, the zh-CN parity check and the customer-safety check.
 
 ```bash
 make fmt-check validate
+make test                                # terraform test with a mock provider
 make lint
+python3 scripts/ci/zh_parity_check.py    # EN and zh-CN docs stay in sync
+bash scripts/ci/customer_safety_check.sh # no state files, tenant IDs or project numbers
 pre-commit run -a
 shellcheck scripts/source-prep/*.sh templates/*/scripts/*.sh
 ```
 
-- **Terraform**: formatted, valid in both templates, and no new TFLint or Checkov findings. If a Checkov finding is intentional, suppress it inline with a `checkov:skip` comment that gives the reason.
+- **Terraform**: formatted, valid in all three roots, `terraform test` passes, and no new TFLint or trivy findings. If a trivy finding is intentional, add it to `.trivyignore` with a comment that gives the reason.
 - **Scripts**: ShellCheck-clean, `set -euo pipefail`, and no secrets on the command line or in logs.
 - **Mermaid**: every `mermaid` block must render on GitHub. Quote labels that contain special characters, use `<br/>` for line breaks, and preview the file on GitHub (or with `@mermaid-js/mermaid-cli`) before you request review.
 

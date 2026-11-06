@@ -67,6 +67,40 @@ flowchart LR
    ```
 3. **身份验证插件：** 在 MySQL 8.4 中，`caching_sha2_password` 是默认身份验证插件，`mysql_native_password` 默认处于禁用状态（并已在 MySQL 9.0 中移除）。在 Cloud SQL 上，`default_authentication_plugin` 参数仅在 MySQL 8.0 中受支持。切换前，请使用 `caching_sha2_password` 重新创建应用账号（第 5 节），并确认所有客户端驱动和连接器均支持该插件。来源：[caching_sha2_password](https://dev.mysql.com/doc/refman/8.4/en/caching-sha2-pluggable-authentication.html)、[原生可插拔身份验证](https://dev.mysql.com/doc/refman/8.4/en/native-pluggable-authentication.html)、[配置数据库参数](https://cloud.google.com/sql/docs/mysql/flags)。
 
+### 1.3 目标模式与连接矩阵
+
+| 设置 | `EXISTING_CLOUDSQL` + `PSC`（默认） | `EXISTING_CLOUDSQL` + `PSA` | `DMS_MANAGED_CLOUDSQL` |
+| :--- | :--- | :--- | :--- |
+| **由谁创建 Cloud SQL** | Terraform（`modules/cloudsql-mysql-destination`） | Terraform | DMS，基于目标连接配置文件 |
+| **DMS → 源端路径** | PSC 接口：挂接到实例的 Network Attachment（`ACCEPT_MANUAL`） | Private Services Access 对等互连（`create_psa_peering` 或现有对等互连） | `connectivity_method`：`VPC_PEERING`、`REVERSE_SSH` 或 `STATIC_IP` |
+| **源端防火墙规则** | 基于 Network Attachment 子网创建 | 不创建；请自行放行 PSA 地址范围 | 不创建 |
+| **应用访问** | PSC 端点 + 私有 DNS 记录（会创建） | 对等互连地址范围内的私有 IP | 取决于连接配置文件的 IP 设置 |
+| **公共 IP** | 无 | 无 | 取决于 DMS；当 DMS 需要公共 IP 时，与 `sql.restrictPublicIp` 不兼容 |
+| **`migration_enabled = false`** | 支持 | 支持 | 拒绝（验证） |
+| **已实测** | 是（TESTING.zh-CN.md） | 否（仅 plan） | 否（仅 plan） |
+
+### 1.4 成本指导
+
+- **DMS：** 原生 MySQL 迁移或复制到 Cloud SQL for MySQL 不收取额外费用（[Database Migration Service 价格](https://cloud.google.com/database-migration/pricing)）。
+- **需要付费的项目：** Cloud SQL 实例（从创建时开始计费，包括处于已降级副本状态期间）及其存储和备份；场景 2 初始数据使用的 Cloud Storage；PSC 端点转发规则；Cloud DNS；防火墙规则日志记录；以及跨区域的网络出站流量（如有）。
+- **缩短计费时长：** 临近迁移开始时再创建目标实例；切换后使用 `migration_enabled = false` 下线迁移对象；提升后删除初始数据；切换后调整实例规格。
+- **概念验证配置：** 在数据副本上进行演练时，使用较小的实例可降低成本，例如：
+  ```hcl
+  cloudsql_edition             = "ENTERPRISE"
+  cloudsql_tier                = "db-custom-2-7680"
+  cloudsql_availability_type   = "ZONAL"
+  cloudsql_disk_size_gb        = 20
+  cloudsql_deletion_protection = false
+  ```
+  生产环境则应根据完整数据集和 CDC 写入速率确定规格（第 1.5 节）。
+
+### 1.5 转储性能与规格
+
+- **转储并行度：** `dump_parallel_level = "OPTIMAL"`（默认）在速度与源端负载之间取得平衡；`MAX` 速度最快，但源端负载最高；`MIN` 占用的源端资源最少（[创建迁移作业](https://cloud.google.com/database-migration/docs/mysql/create-migration-job-existing-instance)）。
+- **短暂的全局锁：** 在由 DMS 管理的转储开始时，DMS 会短暂锁定源端写入。根据 DMS 文档，100 个表约需 1 秒，10,000 个表约需 9 秒，50,000 个表约需 49 秒（[已知限制](https://cloud.google.com/database-migration/docs/mysql/known-limitations)）。请在非高峰时段启动作业，并先通过 `SHOW PROCESSLIST` 检查是否存在长时间运行的事务，因为该锁会等待这些事务完成。
+- **目标实例规格：** 迁移期间，目标实例的 vCPU 和内存至少应与源端相同，以便加载和 CDC 跟上进度，并为数据和二进制日志预留足够的磁盘空间（`disk_autoresize` 已开启）。请关注 `make lag`；如果 CDC 期间延迟持续增长，请在切换前扩容目标实例。切换后再调整规格。
+- **选择性迁移：** `migration_databases`（模板 01）仅迁移列出的数据库。可用于将一个源服务器拆分到多个实例（`examples/multi-database`）。
+
 ---
 
 ## 2. 阶段 1：源 MySQL 8.0 预检验证
@@ -537,3 +571,26 @@ flowchart LR
    # After the import into the long-lived stack succeeds:
    shred -u pre-decommission.tfstate 2>/dev/null || rm -P pre-decommission.tfstate   # Linux: shred; macOS: rm -P
    ```
+
+---
+
+## 11. 故障排查参考
+
+以下症状来自实测（TESTING.zh-CN.md）和 DMS 文档。第 6.1 节更详细地介绍了 `verify` 与 Network Attachment 问题。
+
+| 阶段 | 症状 | 原因 | 解决方法 |
+| :--- | :--- | :--- | :--- |
+| Plan | `subnet` / `network_attachment_subnet` 报 `Error: Invalid value for variable` | 使用了裸子网名称，而非完整路径 | 使用 `projects/PROJECT/regions/REGION/subnetworks/SUBNET` |
+| Plan | 防火墙规则报 `Resource precondition failed` | `source_target_tags` 和 `source_target_service_accounts` 同时设置或均未设置 | 只设置其中一个，或设置 `create_source_firewall_rule = false` |
+| Plan | `db-perf-optimized-N-* tiers are Enterprise Plus tiers` | 层级与版本不匹配 | 设置 `cloudsql_edition = "ENTERPRISE_PLUS"`，或使用 Enterprise 层级 |
+| Apply | `Root user's password is not policy compliant` | 创建时设置了 `cloudsql_password_validation_policy` | 提升后再启用（第 9.1 节） |
+| Apply | 挂接步骤报 `[ERROR_NETWORK_ATTACHMENT_POLICY_FORBIDDEN]` | `ACCEPT_MANUAL` 接受列表中不包含 Cloud SQL 租户项目 | 将 `psc_producer_accept_list` 留空（自动派生）并再次 apply |
+| Apply（场景 2） | `The supplied dump file doesn't exist` | 在上传初始数据之前创建了作业 | 两阶段 apply：`create_migration_job = false`，上传，再次 apply |
+| Apply | `Backups cannot be enabled for read replica instance` | 对已降级的目标实例执行了完整 apply（DMS 更改了其备份设置） | 提升之前不要 apply 实例；仅针对防火墙规则执行 apply（第 6 节） |
+| Verify | `Failure connecting to the source database ...` | 从 Network Attachment 子网到 `tcp:3306` 没有防火墙路径、主机错误，或 `bind_address` 绑定在环回地址上 | 防火墙规则、`make preflight`（`bind_address`） |
+| Verify | TLS 错误，或 `make preflight` 报 WARN `tls` | `source_ssl_type = "REQUIRED"` 时源端未提供 TLS，或 `SERVER_ONLY` 使用了错误的 CA | 在源端配置 TLS，或提供正确的 CA |
+| Verify / start | `Definer is not supported` | DEFINER 用户（例如 `root@localhost`）在 Cloud SQL 上不存在 | 先创建用户，或更改 DEFINER（第 5 节） |
+| CDC | `make lag` 未显示 DMS 指标 | `migration_job/*` 指标可能为空 | `make lag` 会回退到目标实例的 `replica_lag`（`CLOUDSQL_INSTANCE`） |
+| 提升 | `make promote-job` 因 `lag above MAX_LAG_SECONDS` 而停止 | 源端仍有写入 | 停止写入（第 8.3 节）后重试 |
+| 下线 | PSC 端点短暂中断 | 分离 Network Attachment 会重启实例（根据文档，约 3 分钟） | 安排维护窗口（第 10.2 节） |
+| 放弃 | 目标实例保持 `READ_REPLICA_INSTANCE`；`<instance>-master` 仍然存在 | 在提升之前删除了作业 | 执行 `gcloud sql instances promote-replica` 或删除实例；删除 `<instance>-master`（第 10 节） |

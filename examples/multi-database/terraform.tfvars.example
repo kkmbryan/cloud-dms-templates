@@ -1,0 +1,34 @@
+# ==============================================================================
+# Example: two migrations sharing one Network Attachment, firewall rule and DNS
+# zone. Copy to terraform.tfvars (git-ignored). Pass passwords as environment
+# variables, for example from Secret Manager:
+#   export TF_VAR_source_passwords='{"orders-db-cdc":"...","billing-db-cdc":"..."}'
+#   export TF_VAR_cloudsql_root_passwords='{"orders-db-cdc":"...","billing-db-cdc":"..."}'
+# ==============================================================================
+
+project_id                = "my-gcp-project-01"
+region                    = "europe-west2"
+network                   = "projects/my-gcp-project-01/global/networks/my-vpc"
+psc_endpoint_subnet       = "projects/my-gcp-project-01/regions/europe-west2/subnetworks/app-subnet"
+network_attachment_subnet = "projects/my-gcp-project-01/regions/europe-west2/subnetworks/dms-na-subnet"
+network_attachment_name   = "dms-multi-psc-na"
+source_target_tags        = ["mysql-source"]
+
+migrations = {
+  # One source server split across two instances with selective migration.
+  "orders-db-cdc" = {
+    instance_name = "cloudsql-orders-01"
+    source_host   = "10.10.0.10"
+    databases     = ["orders"]
+  }
+  "billing-db-cdc" = {
+    instance_name = "cloudsql-billing-01"
+    source_host   = "10.10.0.10"
+    databases     = ["billing"]
+    edition       = "ENTERPRISE"
+    tier          = "db-custom-4-16384"
+  }
+}
+
+# After every job is promoted:
+# migration_enabled = false

@@ -1,0 +1,18 @@
+# Gitleaks configuration: the default rule set plus an allow-list for the
+# obvious placeholders used in docs, *.tfvars.example files and terraform test
+# files. Do not add real-looking values here; replace them with a placeholder
+# in the file instead.
+title = "cloud-dms-templates gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Documented placeholders, not secrets"
+regexTarget = "secret"
+regexes = [
+  # Password placeholders in READMEs, runbooks and terraform.tfvars.example.
+  '''^REPLACE_ME[A-Z0-9_]*$''',
+  # Fixed values used by the mocked terraform tests (tests/*.tftest.hcl).
+  '''^example-[a-z0-9-]*password$''',
+]

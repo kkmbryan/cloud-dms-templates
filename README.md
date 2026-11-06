@@ -72,7 +72,11 @@ To choose a scenario, use the decision matrix in [runbook section 1](docs/gce_my
   - **`LOGICAL` (Default — `mysqldump`):** One compressed mysqldump file uploaded to the staging bucket. `dump_path` points at the file. Works for `MYSQL_8_0` and `MYSQL_8_4` targets.
   - **`PHYSICAL` (Percona XtraBackup):** A full backup that is **prepared** (`xtrabackup --backup`, then `--prepare`) and uploaded to a **dedicated folder** in the bucket. `dump_path` points at the folder. **`MYSQL_8_0` target only.** Use [`scripts/xtrabackup_to_gcs.sh`](templates/02-backup-migration-gcs-cdc/scripts/xtrabackup_to_gcs.sh).
 - **Automatic bucket IAM:** Terraform grants `roles/storage.objectViewer` and `roles/storage.legacyBucketReader` on the bucket to the DMS service agent and to the Cloud SQL instance service account, and `roles/storage.objectCreator` + `roles/storage.objectViewer` to `backup_writer_members`. In `DMS_MANAGED_CLOUDSQL` mode, DMS creates the instance after apply, so grant its service account both reader roles yourself before `verify`: `gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer` (repeat with `roles/storage.legacyBucketReader`).
-- **Terraform Provider Mutual Exclusivity Guardrail:** In `google_database_migration_service_migration_job`, `dump_path` and `dump_flags` are mutually exclusive. When `dump_path` is set (Scenario 2), `modules/dms-migration-job` omits `dump_flags` and `performance_config`.
+- **Terraform Provider Mutual Exclusivity Guardrail:** In `google_database_migration_service_migration_job`, `dump_path` and `dump_flags` are mutually exclusive. When `dump_path` is set (Scenario 2), `modules/dms-migration-job` omits `performance_config` and rejects `dump_flags` and selective migration (`databases`).
+
+### Several Databases or Instances (`examples/multi-database`)
+- **Best For:** Several source databases or servers that go to several Cloud SQL instances (DMS runs one migration job per destination instance).
+- **Workflow:** one `migrations` map entry per job. All entries share one Network Attachment (`ACCEPT_MANUAL` with the tenant projects of all instances), one firewall rule and one private DNS zone; each gets its own instance, PSC endpoint and DNS record. `databases` (selective migration) splits one source server across instances. See [examples/multi-database/README.md](examples/multi-database/README.md).
 
 ### Support Matrix
 
@@ -152,10 +156,14 @@ cloud-dms-templates/
 ├── modules/
 │   ├── networking-psc/                   # PSC Network Attachment (ACCEPT_MANUAL) + source firewall rule (or PSA peering)
 │   ├── gcs-migration-staging/            # Staging bucket + reader/writer IAM
-│   ├── cloudsql-mysql-destination/       # Cloud SQL MySQL 8.0 / 8.4 target + PSC interface
+│   ├── cloudsql-mysql-destination/       # Cloud SQL MySQL 8.0 / 8.4 target (PSC, no public IP)
+│   ├── cloudsql-psc-outbound/            # Attach/detach the Network Attachment (PSC interface) via gcloud
 │   ├── cloudsql-psc-endpoint/            # PSC consumer endpoint + private DNS for applications
 │   ├── dms-connection-profiles/          # Source and destination DMS connection profiles
 │   └── dms-migration-job/                # Continuous DMS migration job + demote step
+├── examples/
+│   └── multi-database/                   # Several jobs/instances sharing one Network Attachment and DNS zone
+├── scripts/ci/                           # CI helpers: zh-CN parity, generic customer-safety check
 └── templates/
     ├── 01-live-migration-gce-cdc/        # Root Template 1: DMS-managed dump + CDC
     │   ├── .terraform.lock.hcl
@@ -180,7 +188,9 @@ Every scenario follows the same order: **preflight → apply → produce the see
 ### Validate All Templates Locally
 ```bash
 make fmt-check
-make validate
+make validate   # templates and examples/multi-database
+make test       # terraform test with a mock provider (no cloud calls)
+make lint       # tflint, if installed
 ```
 
 ### Deploy Scenario 1 (Live Migration + CDC)
@@ -224,23 +234,29 @@ terraform apply tfplan
 ```
 
 ### Day-2 DMS Job Verification, Monitoring & Cutover Promotion
+The DMS targets need `PROJECT_ID`. `JOB_ID` and `CLOUDSQL_INSTANCE` default to the Terraform outputs of `TF_DIR` (default `templates/01-live-migration-gce-cdc`); set them explicitly for `examples/multi-database`.
 ```bash
-# Scenario 1 job ID: gce-live-mysql80-cdc. Scenario 2 job ID: gcs-bkp-mysql80-cdc.
+export PROJECT_ID=my-gcp-project-01
 # Verify source/destination connectivity, GTID/binlog settings and (Scenario 2) bucket access
-make verify-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
+make verify-job PROJECT_ID=$PROJECT_ID                       # Scenario 1 (TF_DIR default)
+make verify-job PROJECT_ID=$PROJECT_ID TF_DIR=templates/02-backup-migration-gcs-cdc
 
-# Start the migration job
-make start-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
+# Start, then watch state/phase (FULL_DUMP -> CDC) and replication lag (DMS metric
+# max_replica_sec_lag, falling back to the destination's Cloud SQL replica_lag)
+make start-job  PROJECT_ID=$PROJECT_ID
+make status-job PROJECT_ID=$PROJECT_ID
+make lag        PROJECT_ID=$PROJECT_ID LAG_MINUTES=30
 
-# Monitor the job state and phase (FULL_DUMP -> CDC). Replication lag is in Cloud Monitoring:
-# datamigration.googleapis.com/migration_job/max_replica_sec_lag; make lag falls back to the
-# destination's cloudsql.googleapis.com/database/replication/replica_lag when CLOUDSQL_INSTANCE is set
-make status-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
-make lag PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc LAG_MINUTES=30 CLOUDSQL_INSTANCE=<cloudsql_instance_name>
+# Pause and continue CDC, or start over (restart re-dumps the data)
+make stop-job   PROJECT_ID=$PROJECT_ID
+make resume-job PROJECT_ID=$PROJECT_ID
 
-# Promote the Cloud SQL destination during the cutover window
-make promote-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
+# Guarded promote: the job must be RUNNING in CDC with lag <= MAX_LAG_SECONDS (default 10),
+# then you type the job ID to confirm (CONFIRM=yes skips the prompt in automation)
+make promote-job PROJECT_ID=$PROJECT_ID MAX_LAG_SECONDS=5
 ```
+
+`make demote-destination` is for manual recovery only; `terraform apply` already demotes the destination once.
 
 Before you promote, complete the Go / No-Go checklist and the rollback decision in runbook section 8. After promotion, applications connect to `terraform output -raw psc_endpoint_dns_name` (the instance DNS name, resolved by the private zone to the PSC endpoint IP) over TLS; then run `terraform plan`/`apply` (runbook section 9.1). To retire the migration objects and keep Cloud SQL, set `migration_enabled = false` and apply (runbook section 10.2; detaching the Network Attachment restarts the instance).
 

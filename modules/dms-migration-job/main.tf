@@ -46,6 +46,26 @@ resource "google_database_migration_service_migration_job" "migration" {
     }
   }
 
+  # Selective migration (gcloud --databases-filter): migrate only the listed
+  # databases. Empty list = all databases.
+  dynamic "objects_config" {
+    for_each = length(var.databases) > 0 ? [1] : []
+    content {
+      source_objects_config {
+        objects_selection_type = "SPECIFIED_OBJECTS"
+        dynamic "object_configs" {
+          for_each = var.databases
+          content {
+            object_identifier {
+              type     = "DATABASE"
+              database = object_configs.value
+            }
+          }
+        }
+      }
+    }
+  }
+
   dynamic "vpc_peering_connectivity" {
     for_each = !local.use_existing_cloudsql && var.connectivity_method == "VPC_PEERING" ? [1] : []
     content {
@@ -75,6 +95,14 @@ resource "google_database_migration_service_migration_job" "migration" {
   # deleted before promotion leaves the instance as a read replica: promote it
   # with `gcloud sql instances promote-replica` or delete it.
   lifecycle {
+    precondition {
+      condition     = length(var.databases) == 0 || !local.use_gcs_backup_dump
+      error_message = "databases (selective migration) is supported only with the DMS-managed dump (no dump_path). For a Cloud Storage seed, dump only the databases you want to migrate."
+    }
+    precondition {
+      condition     = length(var.dump_flags) == 0 || !local.use_gcs_backup_dump
+      error_message = "dump_flags apply only to the DMS-managed dump; they are mutually exclusive with dump_path."
+    }
     precondition {
       condition     = !(var.dump_type == "PHYSICAL" && !local.use_gcs_backup_dump)
       error_message = "dump_type = \"PHYSICAL\" requires dump_path (a GCS folder with a prepared Percona XtraBackup backup)."

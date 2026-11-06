@@ -9,9 +9,12 @@
 | 检查项 | 工具与版本 | 范围 | 结果 |
 | :--- | :--- | :--- | :--- |
 | 格式 | `terraform fmt -check -recursive`（Terraform 1.11.4） | 所有模块和模板 | 通过 |
-| 验证 | `terraform init -backend=false` + `terraform validate`（Terraform 1.11.4，`hashicorp/google` 8.10.0） | 两个根模板 | 通过 |
+| 验证 | `terraform init -backend=false` + `terraform validate`（Terraform 1.11.4，`hashicorp/google` 8.10.0） | 全部三个根配置（两个模板和 `examples/multi-database`） | 通过 |
 | 规划 | 在 `europe-west2` 的空测试项目中运行 `terraform plan`（不执行 apply） | 两个模板：默认 `EXISTING_CLOUDSQL` + `PSC` 模式，以及 `DMS_MANAGED_CLOUDSQL`、`PHYSICAL` + `MYSQL_8_0`、关闭 PSC 端点、使用现有 DNS 区域等变体 | 通过 |
 | 负面验证 | `terraform plan` | `PHYSICAL` + `MYSQL_8_4`、`PHYSICAL` 使用文件路径、`backup_gcs_path` 带结尾斜杠、源密码超过 32 个字符 | 按预期被拒绝 |
+| `terraform test`（PR-4） | Terraform 1.11.4，`mock_provider "google"`，`command = plan` | 模板 01（plan + 模块运行）、模板 02、`examples/multi-database` | 通过。覆盖 PSC/PSA、两种目标模式、PHYSICAL/LOGICAL 规则、`migration_enabled`、防火墙与 TLS 前置条件、派生的接受列表、选择性迁移以及变量验证 |
+| CI（PR-4） | 按提交 SHA 固定的 GitHub Actions | fmt、在 google 8.0.0 与最新 8.x 上执行 validate、`terraform test`、tflint、trivy、gitleaks、zh-CN 对齐检查、通用客户安全检查、ShellCheck | 通过 |
+| 移动挂接步骤（PR-4） | Terraform 1.11.4，`gcloud` 为桩程序 | PR-3 状态，然后使用 PR-4 布局（`modules/cloudsql-psc-outbound`） | plan 显示移动且无更改；将 `count` 设为 0 会运行销毁时的分离步骤 |
 | Shell 检查 | ShellCheck 0.10.0 | `templates/02-backup-migration-gcs-cdc/scripts/xtrabackup_to_gcs.sh`、`scripts/source-prep/preflight_check.sh` | 通过 |
 | `psc_config` 上的 `ignore_changes` | `terraform plan`（PR-3） | 模板 01，以原生方式管理 `network_attachment_uri` | 从实例引用 Network Attachment 会产生依赖循环（`ACCEPT_MANUAL` 挂接需要先有实例）。创建后使用字面 URI 时，plan 显示没有更改。模板保留 `ignore_changes`。 |
 | 从 PR-2 状态升级 | Terraform 1.11.4，使用挂接和降级 `terraform_data` 块，`gcloud` 为桩程序 | PR-2 状态，然后使用 PR-3 代码 | plan：2 处原地更新 `input`，无替换。在旧状态上将 `count` 设为 0 或进行替换时，销毁时的分离步骤运行无错误。 |
@@ -30,6 +33,7 @@
 | 2026-11-06 | PR-3（T6） | MySQL 8.0.46 | Cloud SQL for MySQL 8.0，Enterprise，可用区级 | 1（模板 01） | 由 DMS 管理的逻辑转储 | 通过：使用全部默认值的单次 apply（`ACCEPT_MANUAL`、以服务账号为目标的防火墙规则、`REQUIRED` TLS）、verify、start、CDC。删除 `RUNNING` 作业（不使用 `--force`）被接受；实例仍为只读副本。随后 `terraform destroy` 分离了 Network Attachment 并删除了所有资源。 |
 | 2026-11-06 | PR-3（T7） | MySQL 8.0.46 | Cloud SQL for MySQL 8.4，Enterprise，可用区级，CMEK | 2（模板 02） | CMEK 存储桶中的 mysqldump 文件（`LOGICAL`） | 通过：使用 `cloudsql_kms_key_name` 和 `staging_bucket_kms_key_name` 的两阶段 apply、非当前版本生命周期规则、verify、start、CDC。在作业处于 CDC 阶段且为 `RUNNING` 时执行 `terraform destroy`，删除了作业（约 1 分钟），分离了 Network Attachment，并在约 7 分钟内销毁了全部 16 个资源。 |
 | 2026-11-06 | PR-3（负面测试） | MySQL 8.0.46 | Cloud SQL for MySQL 8.4 | 1（模板 01） | — | (a) `create_source_firewall_rule = false`：`verify` 失败，报错 "Failure connecting to the source database. Make sure the connectivity information on the connection profile is correct and the source database is reachable." (b) `ACCEPT_MANUAL` 且 `psc_producer_accept_list` 错误：挂接步骤失败并报错 `[ERROR_NETWORK_ATTACHMENT_POLICY_FORBIDDEN]`，且未创建连接端点；修正列表后挂接被原地更新，下一次 apply 完成了挂接。 |
+| 2026-11-06 | PR-4（T8） | MySQL 8.0.46，单台虚拟机上的两个数据库 | 两个 Cloud SQL 实例（8.4 和 8.0），Enterprise，可用区级 | `examples/multi-database` | 由 DMS 管理的转储，配合选择性迁移（`databases`） | 通过：单次 apply 在约 13 分钟内创建了 23 个资源；两个实例均挂接到同一个 `ACCEPT_MANUAL` Network Attachment（2 个连接为 `ACCEPTED`，接受列表中包含一个租户项目）、一条防火墙规则、一个包含两条记录的 DNS 区域。对两个作业执行 `make verify-job` 和 `make start-job`；每个实例仅包含各自的数据库和 CDC 行。对第二个作业执行 `make stop-job` / `make resume-job`。对第一个作业执行带防护的 `make promote-job`：拒绝了错误的确认输入和 `STOPPED` 状态的作业，随后完成提升（通过 Cloud SQL 回退指标测得延迟为 0 秒）；之后通过其 PSC 端点完成 TLS 写入。随后执行 `terraform destroy`。 |
 
 ## 3. 已知限制
 
