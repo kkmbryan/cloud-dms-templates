@@ -408,6 +408,25 @@ run "job_databases_with_dump_path_rejected" {
   expect_failures = [google_database_migration_service_migration_job.migration]
 }
 
+run "job_dump_flags_with_dump_path_rejected" {
+  command = plan
+
+  module {
+    source = "../../modules/dms-migration-job"
+  }
+
+  variables {
+    project_id                     = "my-gcp-project-01"
+    region                         = "europe-west2"
+    source_connection_profile      = "projects/my-gcp-project-01/locations/europe-west2/connectionProfiles/src"
+    destination_connection_profile = "projects/my-gcp-project-01/locations/europe-west2/connectionProfiles/dest"
+    dump_path                      = "gs://my-dms-staging-bucket/mysqldump/mysql80-dump.sql.gz"
+    dump_flags                     = [{ name = "max-allowed-packet", value = "1G" }]
+  }
+
+  expect_failures = [google_database_migration_service_migration_job.migration]
+}
+
 run "job_display_name_with_dot_rejected" {
   command = plan
 

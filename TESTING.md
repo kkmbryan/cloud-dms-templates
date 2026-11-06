@@ -9,7 +9,7 @@ This page records what has been tested, with which versions, and what is known n
 | Check | Tool and version | Scope | Result |
 | :--- | :--- | :--- | :--- |
 | Formatting | `terraform fmt -check -recursive` (Terraform 1.11.4) | All modules and templates | Pass |
-| Validation | `terraform init -backend=false` + `terraform validate` (Terraform 1.11.4, `hashicorp/google` 8.10.0) | Both root templates | Pass |
+| Validation | `terraform init -backend=false` + `terraform validate` (Terraform 1.11.4, `hashicorp/google` 8.10.0) | All three roots (both templates and `examples/multi-database`) | Pass |
 | Plan | `terraform plan` against an empty test project in `europe-west2` (no apply) | Both templates, default `EXISTING_CLOUDSQL` + `PSC` mode, plus `DMS_MANAGED_CLOUDSQL`, `PHYSICAL` + `MYSQL_8_0`, PSC endpoint off, and existing DNS zone variants | Pass |
 | Negative validation | `terraform plan` | `PHYSICAL` + `MYSQL_8_4`, `PHYSICAL` with a file path, `backup_gcs_path` with a trailing slash, source password longer than 32 characters | Rejected, as intended |
 | `terraform test` (PR-4) | Terraform 1.11.4, `mock_provider "google"`, `command = plan` | Template 01 (plan + module runs), template 02, `examples/multi-database` | Pass. Covers PSC/PSA, both destination modes, PHYSICAL/LOGICAL rules, `migration_enabled`, firewall and TLS preconditions, the derived accept list, selective migration and the variable validations |

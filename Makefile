@@ -48,15 +48,19 @@ define DMS_CTX
 set -euo pipefail; \
 case "$(PROJECT_ID)" in ""|my-gcp-project-id|my-gcp-project-01) \
   echo "ERROR: set PROJECT_ID=<your project ID> (for example make $@ PROJECT_ID=...)." >&2; exit 2;; esac; \
+tfout() { \
+  terraform -chdir=$(TF_DIR) output -json "$$1" 2>/dev/null | \
+    python3 -c 'import json, sys; v = json.load(sys.stdin); print(v if isinstance(v, str) else "")' 2>/dev/null; \
+}; \
 JOB="$(JOB_ID)"; \
 if [ -z "$$JOB" ]; then \
-  if ! JOB="$$(terraform -chdir=$(TF_DIR) output -raw migration_job_id 2>/dev/null)" || [ -z "$$JOB" ]; then \
+  if ! JOB="$$(tfout migration_job_id)" || [ -z "$$JOB" ]; then \
     echo "ERROR: set JOB_ID, or TF_DIR to an applied template that outputs migration_job_id." >&2; exit 2; \
   fi; \
 fi; \
 INSTANCE="$(CLOUDSQL_INSTANCE)"; \
 if [ -z "$$INSTANCE" ]; then \
-  INSTANCE="$$(terraform -chdir=$(TF_DIR) output -raw cloudsql_instance_name 2>/dev/null)" || INSTANCE=""; \
+  INSTANCE="$$(tfout cloudsql_instance_name)" || INSTANCE=""; \
 fi; \
 GC=(--region="$(REGION)" --project="$(PROJECT_ID)"); \
 run_op() { \

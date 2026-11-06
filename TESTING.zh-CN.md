@@ -9,7 +9,7 @@
 | 检查项 | 工具与版本 | 范围 | 结果 |
 | :--- | :--- | :--- | :--- |
 | 格式 | `terraform fmt -check -recursive`（Terraform 1.11.4） | 所有模块和模板 | 通过 |
-| 验证 | `terraform init -backend=false` + `terraform validate`（Terraform 1.11.4，`hashicorp/google` 8.10.0） | 两个根模板 | 通过 |
+| 验证 | `terraform init -backend=false` + `terraform validate`（Terraform 1.11.4，`hashicorp/google` 8.10.0） | 全部三个根配置（两个模板和 `examples/multi-database`） | 通过 |
 | 规划 | 在 `europe-west2` 的空测试项目中运行 `terraform plan`（不执行 apply） | 两个模板：默认 `EXISTING_CLOUDSQL` + `PSC` 模式，以及 `DMS_MANAGED_CLOUDSQL`、`PHYSICAL` + `MYSQL_8_0`、关闭 PSC 端点、使用现有 DNS 区域等变体 | 通过 |
 | 负面验证 | `terraform plan` | `PHYSICAL` + `MYSQL_8_4`、`PHYSICAL` 使用文件路径、`backup_gcs_path` 带结尾斜杠、源密码超过 32 个字符 | 按预期被拒绝 |
 | `terraform test`（PR-4） | Terraform 1.11.4，`mock_provider "google"`，`command = plan` | 模板 01（plan + 模块运行）、模板 02、`examples/multi-database` | 通过。覆盖 PSC/PSA、两种目标模式、PHYSICAL/LOGICAL 规则、`migration_enabled`、防火墙与 TLS 前置条件、派生的接受列表、选择性迁移以及变量验证 |
