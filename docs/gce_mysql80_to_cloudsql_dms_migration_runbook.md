@@ -1,5 +1,7 @@
 # Operational Runbook: GCE Self-Managed MySQL 8.0 to Cloud SQL (8.0 / 8.4) Migration via Cloud DMS
 
+**English** | [简体中文](gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md)
+
 > [!IMPORTANT]
 > **Target MySQL Version Policy (`MYSQL_8_0` & `MYSQL_8_4` LTS)**
 > Google Cloud Database Migration Service (DMS) supports migrating from **MySQL 8.0** to **Cloud SQL for MySQL 8.0 (`MYSQL_8_0`)** or **Cloud SQL for MySQL 8.4 LTS (`MYSQL_8_4`)**.

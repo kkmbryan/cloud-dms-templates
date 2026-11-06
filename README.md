@@ -1,5 +1,7 @@
 # GCE MySQL 8.0 to Cloud SQL for MySQL (8.0 / 8.4 LTS) — Cloud DMS Terraform Templates
 
+**English** | [简体中文](README.zh-CN.md)
+
 Enterprise-grade, modular Terraform configurations for migrating self-managed **MySQL 8.0 on Google Compute Engine (GCE)** to **Cloud SQL for MySQL (`MYSQL_8_0` or `MYSQL_8_4` Enterprise Plus)** using **Google Cloud Database Migration Service (DMS)** with Continuous Change Data Capture (CDC) for near-zero downtime cutover.
 
 ---
@@ -67,9 +69,12 @@ cloud-dms-templates/
 ├── .tflint.hcl                           # TFLint Google ruleset configuration
 ├── Makefile                              # Day-1/Day-2 automation targets
 ├── README.md                             # Root architecture & usage documentation
+├── README.zh-CN.md                       # Simplified Chinese (zh-CN) root documentation
 ├── docs/
 │   ├── gce_mysql80_to_cloudsql_dms_migration_runbook.md
-│   └── sme_audit_and_validation_report.md
+│   ├── gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md
+│   ├── sme_audit_and_validation_report.md
+│   └── sme_audit_and_validation_report.zh-CN.md
 ├── modules/
 │   ├── networking-psc/                   # PSC Network Attachment + DMS Private Connection (or PSA)
 │   ├── gcs-migration-staging/            # Hardened GCS staging bucket + least-privilege IAM
@@ -78,7 +83,11 @@ cloud-dms-templates/
 │   └── dms-migration-job/                # Continuous DMS Migration Job (Live or GCS Backup-Seeded)
 └── templates/
     ├── 01-live-migration-gce-cdc/        # Root Template 1: Live Dump + Continuous CDC
+    │   ├── README.md
+    │   └── README.zh-CN.md
     └── 02-backup-migration-gcs-cdc/      # Root Template 2: GCS Backup (Physical/Logical) + CDC
+        ├── README.md
+        ├── README.zh-CN.md
         └── scripts/
             └── stream_xtrabackup_to_gcs.sh
 ```

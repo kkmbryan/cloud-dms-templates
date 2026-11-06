@@ -1,5 +1,7 @@
 # Cloud DMS Migration — Multi-SME Architecture, Security & Terraform Validation Report
 
+**English** | [简体中文](sme_audit_and_validation_report.zh-CN.md)
+
 - **Scope**: Enterprise Customer-Agnostic Reference Architecture
 - **Source Environment**: Self-Managed MySQL 8.0 on Google Compute Engine (GCE)
 - **Destination Environment**: Cloud SQL for MySQL (`MYSQL_8_4` LTS Default or `MYSQL_8_0`, Enterprise Plus Regional HA)

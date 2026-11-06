@@ -1,5 +1,7 @@
 # Scenario 2: Migration from Backup in GCS (Percona XtraBackup / mysqldump) + Continuous CDC
 
+**English** | [简体中文](README.zh-CN.md)
+
 ## Overview
 
 This root Terraform template deploys a **Backup-Seeded Continuous Change Data Capture (CDC)** migration pipeline using **Google Cloud Database Migration Service (DMS)** for multi-terabyte or load-sensitive **self-managed MySQL 8.0 on Compute Engine (GCE)** workloads migrating to **Cloud SQL for MySQL (`MYSQL_8_4` LTS default or `MYSQL_8_0`)**.
