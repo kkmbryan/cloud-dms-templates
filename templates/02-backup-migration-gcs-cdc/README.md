@@ -19,28 +19,28 @@ This root Terraform template deploys a **Backup-Seeded Continuous Change Data Ca
 ```mermaid
 flowchart LR
     subgraph GCE_VPC["Production VPC"]
-        GCE["GCE VM: Self-Managed MySQL 8.0\n(GTID=ON, ROW Binlog)"]
-        NA["PSC Network Attachment\n(dms-mysql-psc-na)"]
+        GCE["GCE VM: Self-Managed MySQL 8.0<br/>(GTID=ON, ROW Binlog)"]
+        NA["PSC Network Attachment<br/>(dms-mysql-psc-na)"]
     end
 
     subgraph GCS_Stage["Regional Cloud Storage"]
-        GCS["GCS Staging Bucket\n(Percona XtraBackup PHYSICAL\nor mysqldump LOGICAL)"]
+        GCS["GCS Staging Bucket<br/>(Percona XtraBackup PHYSICAL<br/>or mysqldump LOGICAL)"]
     end
 
     subgraph DMS_Control["Google Cloud DMS"]
-        JOB["DMS Migration Job\n(CONTINUOUS: GCS dump_path + CDC\n+ demote-destination)"]
+        JOB["DMS Migration Job<br/>(CONTINUOUS: GCS dump_path + CDC<br/>+ demote-destination)"]
     end
 
     subgraph CloudSQL_Producer["Cloud SQL Producer VPC"]
-        CSQL["Cloud SQL for MySQL 8.4 / 8.0\n(Pure PSC + network_attachment_uri)"]
+        CSQL["Cloud SQL for MySQL 8.4 / 8.0<br/>(Pure PSC + network_attachment_uri)"]
     end
 
-    GCE -->|1. Stream Non-Blocking Backup\nstream_xtrabackup_to_gcs.sh| GCS
-    GCS -->|2. Restore Initial Seed\n(dump_path)| CSQL
-    CSQL -->|PSC Outbound: network_attachment_uri| NA
-    NA -->|Internal Routing (Port 3306)| GCE
-    GCE -->|3. Continuous GTID Binlog CDC| CSQL
-    JOB -->|Orchestrates Seed, Demote & CDC| CSQL
+    GCE -->|"Step 1: Stream Non-Blocking Backup<br/>stream_xtrabackup_to_gcs.sh"| GCS
+    GCS -->|"Step 2: Restore Initial Seed<br/>(dump_path)"| CSQL
+    CSQL -->|"PSC Outbound: network_attachment_uri"| NA
+    NA -->|"Internal Routing (Port 3306)"| GCE
+    GCE -->|"Step 3: Continuous GTID Binlog CDC"| CSQL
+    JOB -->|"Orchestrates Seed, Demote & CDC"| CSQL
 ```
 
 ---
