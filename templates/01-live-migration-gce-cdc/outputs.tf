@@ -44,7 +44,7 @@ output "psc_endpoint_dns_name" {
 }
 
 output "psc_endpoint_connection_status" {
-  description = "PSC connection status of the endpoint as of the last refresh (expect ACCEPTED)."
+  description = "PSC connection status of the endpoint, captured at apply; run terraform refresh (or apply) to update. Expect ACCEPTED."
   value       = module.cloudsql_psc_endpoint.psc_connection_status
 }
 

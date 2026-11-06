@@ -26,7 +26,8 @@ resource "google_sql_database_instance" "destination" {
   deletion_protection = var.deletion_protection
 
   # Write-only argument (Terraform >= 1.11): the root password is sent to the
-  # API but never stored in the Terraform plan or state.
+  # API but not stored in Terraform state. A saved plan file (terraform plan
+  # -out) still contains root module input variables, so protect plan files.
   root_password_wo         = var.root_password
   root_password_wo_version = nonsensitive(var.root_password != null) ? tostring(var.root_password_wo_version) : null
 

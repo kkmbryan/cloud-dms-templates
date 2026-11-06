@@ -83,6 +83,7 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM HUP
 
 if [[ -n "${XTRABACKUP_DEFAULTS_FILE:-}" ]]; then
   [[ -r "${XTRABACKUP_DEFAULTS_FILE}" ]] || die "Cannot read ${XTRABACKUP_DEFAULTS_FILE}."
@@ -103,16 +104,18 @@ else
   TMP_CNF="$(mktemp "${TMP_DIR_FOR_CNF}/xtrabackup-cnf.XXXXXX")"
   chmod 600 "${TMP_CNF}"
   # Escape backslashes and double quotes for the MySQL option file format.
+  esc_user="${XTRABACKUP_USER//\\/\\\\}"
+  esc_user="${esc_user//\"/\\\"}"
   esc_pw="${XTRABACKUP_PASSWORD//\\/\\\\}"
   esc_pw="${esc_pw//\"/\\\"}"
   {
     for group in client xtrabackup; do
       echo "[${group}]"
-      echo "user=\"${XTRABACKUP_USER}\""
+      echo "user=\"${esc_user}\""
       echo "password=\"${esc_pw}\""
     done
   } >"${TMP_CNF}"
-  unset XTRABACKUP_PASSWORD esc_pw
+  unset XTRABACKUP_PASSWORD esc_pw esc_user
   CNF="${TMP_CNF}"
 fi
 
@@ -123,7 +126,7 @@ CONN_ARGS=()
 
 # --defaults-extra-file must be the first option.
 mysql_q() {
-  mysql --defaults-extra-file="${CNF}" "${CONN_ARGS[@]}" --batch --skip-column-names -e "$1"
+  mysql --defaults-extra-file="${CNF}" ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} --batch --skip-column-names -e "$1"
 }
 
 # ------------------------------------------------------------------------------
@@ -181,7 +184,7 @@ mkdir -p "${TARGET_DIR}"
 log "Backing up ${MYSQL_DATADIR} to ${TARGET_DIR} (log: ${LOG_FILE})..."
 BACKUP_ARGS=(--backup --target-dir="${TARGET_DIR}" --datadir="${MYSQL_DATADIR}" --parallel="${PARALLEL_THREADS}")
 [[ "${XTRABACKUP_COMPRESS}" == "true" ]] && BACKUP_ARGS+=(--compress)
-xtrabackup --defaults-extra-file="${CNF}" "${CONN_ARGS[@]}" "${BACKUP_ARGS[@]}" 2>>"${LOG_FILE}" ||
+xtrabackup --defaults-extra-file="${CNF}" ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} "${BACKUP_ARGS[@]}" 2>>"${LOG_FILE}" ||
   die "xtrabackup --backup failed. See ${LOG_FILE}."
 tail -n 5 "${LOG_FILE}" | grep -q "completed OK!" || die "xtrabackup --backup did not report 'completed OK!'. See ${LOG_FILE}."
 

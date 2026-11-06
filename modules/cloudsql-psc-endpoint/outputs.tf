@@ -9,7 +9,7 @@ output "forwarding_rule_self_link" {
 }
 
 output "psc_connection_status" {
-  description = "PSC connection status of the endpoint (ACCEPTED when the instance accepts it)."
+  description = "PSC connection status of the endpoint, captured at apply; run terraform refresh (or apply) to update. Expect ACCEPTED."
   value       = var.enabled ? google_compute_forwarding_rule.psc_endpoint[0].psc_connection_status : null
 }
 

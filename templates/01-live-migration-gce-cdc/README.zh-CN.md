@@ -45,7 +45,7 @@ flowchart LR
 
 ## 使用说明
 
-请先完成[前提条件](../../README.zh-CN.md)以及[运维手册第 2 节](../../docs/gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md)中的源端准备工作。
+请先完成[前提条件](../../README.zh-CN.md#3-前提条件)以及[运维手册第 2 节](../../docs/gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md)中的源端准备工作。
 
 ### 1. 配置变量
 

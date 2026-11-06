@@ -119,7 +119,7 @@ GRANT SELECT ON performance_schema.keyring_component_status TO 'xtrabackup'@'loc
 
 ## 4. 阶段 3：执行迁移
 
-请先完成[前提条件](../README.zh-CN.md)。顺序始终为：**apply → 生成初始数据（场景 2）→ verify → start**。
+请先完成[前提条件](../README.zh-CN.md#3-前提条件)。顺序始终为：**apply → 生成初始数据（场景 2）→ verify → start**。
 
 ### 方案 A：场景 1 — 在线迁移 + 持续 CDC（`templates/01-live-migration-gce-cdc`）
 
