@@ -17,12 +17,16 @@ Modular Terraform configurations for migrating self-managed **MySQL 8.0 on Compu
 | **Network Connectivity** | **Private Service Connect (`PSC`)** by Default (Optional `PSA`) | The Cloud SQL instance is PSC-only (no public IP). For replication, a Compute Engine Network Attachment is attached to the instance (`psc_config.network_attachment_uri`, PSC interface) so that DMS reaches the source inside your VPC. For applications, the templates create a PSC consumer endpoint (internal IP + forwarding rule) and a private Cloud DNS record for the instance DNS name. |
 | **Target Edition & HA** | Cloud SQL **Enterprise Plus** (`REGIONAL` HA + Data Cache) | Regional high availability, Data Cache (`data_cache_enabled = true`), point-in-time recovery through binary logging, and automated backups. |
 | **Cutover Strategy** | Continuous Replication (`type = "CONTINUOUS"`) | Both templates replicate GTID-based binary log changes after the initial seed, so you can validate the destination and promote it during a short maintenance window. |
+| **Network Security** | `ACCEPT_MANUAL` Network Attachment + source firewall rule | The Network Attachment accepts only the Cloud SQL tenant project, derived from the instance in the same apply (`ACCEPT_AUTOMATIC` is opt-in). A firewall rule (logging on) allows only the Network Attachment subnet to reach the source MySQL port. See [docs/security_hardening.md](docs/security_hardening.md). |
+| **Encryption in Transit** | `source_ssl_type = "REQUIRED"`, `cloudsql_ssl_mode = "ENCRYPTED_ONLY"` | DMS replicates from the source over TLS, and Cloud SQL accepts only encrypted client connections. CMEK (`cloudsql_kms_key_name`, `staging_bucket_kms_key_name`) is optional. |
+| **Lifecycle** | `migration_enabled = true` → `false` after cutover | Setting it to `false` retires the DMS job, profiles, Network Attachment and firewall rule, and keeps Cloud SQL, the PSC endpoint and DNS (runbook section 10.2). |
 
 ```mermaid
 flowchart LR
   subgraph APP_VPC["Customer VPC (europe-west2)"]
     GCE["MySQL 8.0 source VM<br/>(GTID=ON, ROW binlog)"]
-    NA["PSC Network Attachment<br/>(dms-mysql-psc-na)"]
+    NA["PSC Network Attachment<br/>(ACCEPT_MANUAL, dedicated subnet)"]
+    FW["Firewall rule<br/>(NA subnet to tcp:3306)"]
     EP["PSC endpoint + private DNS<br/>(applications)"]
     APP["Applications"]
   end
@@ -40,7 +44,8 @@ flowchart LR
   end
 
   CSQL -->|"PSC interface: replication to port 3306"| NA
-  NA --> GCE
+  NA --> FW
+  FW -->|"TLS (source_ssl_type)"| GCE
   GCE -->|"Scenario 2: upload seed"| GCS
   GCS -->|"Scenario 2: seed from dump_path"| CSQL
   JOB -->|"Orchestrates seed, demote and CDC"| CSQL
@@ -85,11 +90,14 @@ Sources: [Migrate by using a Percona XtraBackup physical file](https://cloud.goo
 
 | Requirement | Details | Check |
 | :--- | :--- | :--- |
-| **Tools** | Terraform `>= 1.11` (write-only root password), Google Cloud CLI (`gcloud`), Bash. The `local-exec` steps (Network Attachment patch, demote) call `gcloud`. | `terraform version`, `gcloud version` |
-| **Credentials** | Application Default Credentials for Terraform and an active `gcloud` account for the `local-exec` steps, both with the deployer roles below. | `gcloud auth application-default login`, `gcloud auth list` |
+| **Tools** | Terraform `>= 1.11` (write-only root password), Google Cloud CLI (`gcloud`), Bash. The `local-exec` steps (attach and detach the Network Attachment, demote) call `gcloud`. | `terraform version`, `gcloud version` |
+| **Credentials** | Application Default Credentials for Terraform and an active `gcloud` account for the `local-exec` steps, both with the deployer roles below. To use one identity for both, set `impersonate_service_account` (the provider impersonates it and the `local-exec` steps get `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT`); the destroy-time detach step keeps the same setting. | `gcloud auth application-default login`, `gcloud auth list` |
 | **APIs** | `datamigration`, `sqladmin`, `compute`, `servicenetworking`, `storage`, `dns`. | See commands below |
 | **DMS service agent** | Must exist before the first apply (Scenario 2 grants it bucket access). | See commands below |
-| **Deployer roles** | `roles/datamigration.admin`, `roles/cloudsql.admin`, `roles/compute.networkAdmin`, `roles/dns.admin`, `roles/storage.admin` (Scenario 2), and `roles/serviceusage.serviceUsageConsumer` on the project. | `gcloud projects get-iam-policy PROJECT_ID` |
+| **Deployer roles** | `roles/datamigration.admin`, `roles/cloudsql.admin`, `roles/compute.networkAdmin`, `roles/compute.securityAdmin` (source firewall rule), `roles/dns.admin`, `roles/storage.admin` (Scenario 2), and `roles/serviceusage.serviceUsageConsumer` on the project. Least-privilege details: [docs/security_hardening.md](docs/security_hardening.md). | `gcloud projects get-iam-policy PROJECT_ID` |
+| **Network** | A dedicated small subnet for the Network Attachment (`network_attachment_subnet`, for example a `/28`), and the source VM's network tag or service account for the firewall rule (`source_target_tags` or `source_target_service_accounts`). | `gcloud compute networks subnets list` |
+| **Org policies** | Check the constraints in the org-policy pre-flight table (`sql.restrictPublicIp`, `gcp.restrictNonCmekServices`, `gcp.resourceLocations`, PSC restrictions). | [docs/security_hardening.md](docs/security_hardening.md) |
+| **State and secrets** | A remote GCS backend with versioning and CMEK (`backend.tf.example` in each template); passwords from Secret Manager through `TF_VAR_*`. | `gcloud secrets versions access latest --secret=...` |
 | **Source database** | GTID and binlog settings and the migration accounts from [runbook section 2](docs/gce_mysql80_to_cloudsql_dms_migration_runbook.md#2-phase-1-source-mysql-80-pre-flight-verification), prepared with [`scripts/source-prep/`](scripts/source-prep/README.md). | `make preflight` (on the source VM) |
 
 ```bash
@@ -111,12 +119,18 @@ gcloud beta services identity create --service=datamigration.googleapis.com --pr
 
 ```text
 cloud-dms-templates/
-├── .github/workflows/
-│   └── terraform-ci.yml                  # Automated fmt & validate CI pipeline
+├── .github/
+│   ├── CODEOWNERS
+│   ├── ISSUE_TEMPLATE/                   # Bug report and feature request templates
+│   ├── pull_request_template.md
+│   └── workflows/
+│       └── terraform-ci.yml              # Automated fmt & validate CI pipeline
 ├── .gitignore                            # Excludes state, .terraform, secrets
 ├── .pre-commit-config.yaml               # Pre-commit hooks (fmt, validate, tflint, checkov)
 ├── .tflint.hcl                           # TFLint Google ruleset configuration
+├── CONTRIBUTING.md                       # Development gates, EN/zh-CN sync, customer-safe content
 ├── LICENSE                               # Apache License 2.0
+├── SECURITY.md                           # Vulnerability reporting (GitHub private advisory)
 ├── Makefile                              # Day-1/Day-2 automation targets
 ├── README.md                             # Root architecture & usage documentation
 ├── README.zh-CN.md                       # Simplified Chinese (zh-CN) root documentation
@@ -124,7 +138,9 @@ cloud-dms-templates/
 ├── TESTING.zh-CN.md
 ├── docs/
 │   ├── gce_mysql80_to_cloudsql_dms_migration_runbook.md
-│   └── gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md
+│   ├── gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md
+│   ├── security_hardening.md             # Network, TLS, secrets, CMEK, org policy, IAM, audit logs
+│   └── security_hardening.zh-CN.md
 ├── scripts/
 │   └── source-prep/                      # Source MySQL 8.0 preparation (make preflight)
 │       ├── 01_mysqld_dms_source.cnf      # my.cnf drop-in: server_id, ROW binlog, GTID, retention
@@ -134,7 +150,7 @@ cloud-dms-templates/
 │       ├── README.md
 │       └── README.zh-CN.md
 ├── modules/
-│   ├── networking-psc/                   # PSC Network Attachment (or PSA peering)
+│   ├── networking-psc/                   # PSC Network Attachment (ACCEPT_MANUAL) + source firewall rule (or PSA peering)
 │   ├── gcs-migration-staging/            # Staging bucket + reader/writer IAM
 │   ├── cloudsql-mysql-destination/       # Cloud SQL MySQL 8.0 / 8.4 target + PSC interface
 │   ├── cloudsql-psc-endpoint/            # PSC consumer endpoint + private DNS for applications
@@ -143,10 +159,12 @@ cloud-dms-templates/
 └── templates/
     ├── 01-live-migration-gce-cdc/        # Root Template 1: DMS-managed dump + CDC
     │   ├── .terraform.lock.hcl
+    │   ├── backend.tf.example            # GCS remote state with versioning + CMEK
     │   ├── README.md
     │   └── README.zh-CN.md
     └── 02-backup-migration-gcs-cdc/      # Root Template 2: seed from Cloud Storage + CDC
         ├── .terraform.lock.hcl
+        ├── backend.tf.example
         ├── README.md
         ├── README.zh-CN.md
         └── scripts/
@@ -169,9 +187,11 @@ make validate
 ```bash
 cd templates/01-live-migration-gce-cdc
 cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars: project_id, network, subnets, source IP
-export TF_VAR_cloudsql_root_password='REPLACE_ME'
-export TF_VAR_source_gce_mysql_password='REPLACE_ME_MAX_32_CHARS'
+# Edit terraform.tfvars: project_id, network, subnets (incl. network_attachment_subnet),
+# source IP and source_target_tags (firewall rule)
+cp backend.tf.example backend.tf   # optional but recommended: remote state (edit bucket/key)
+export TF_VAR_cloudsql_root_password="$(gcloud secrets versions access latest --secret=cloudsql-root-password)"
+export TF_VAR_source_gce_mysql_password="$(gcloud secrets versions access latest --secret=dms-source-password)"
 terraform init
 terraform plan -out=tfplan
 terraform apply tfplan
@@ -222,12 +242,14 @@ make lag PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql8
 make promote-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
 ```
 
-Before you promote, complete the Go / No-Go checklist and the rollback decision in runbook section 8. After promotion, applications connect to `terraform output -raw psc_endpoint_dns_name` (the instance DNS name, resolved by the private zone to the PSC endpoint IP); then run `terraform plan`/`apply` (runbook section 9.1). For teardown and decommission, see runbook section 10.
+Before you promote, complete the Go / No-Go checklist and the rollback decision in runbook section 8. After promotion, applications connect to `terraform output -raw psc_endpoint_dns_name` (the instance DNS name, resolved by the private zone to the PSC endpoint IP) over TLS; then run `terraform plan`/`apply` (runbook section 9.1). To retire the migration objects and keep Cloud SQL, set `migration_enabled = false` and apply (runbook section 10.2; detaching the Network Attachment restarts the instance).
 
 ---
 
 ## 6. Testing, Support and License
 
 - [TESTING.md](TESTING.md) lists the tested versions and scenarios, and the known limitations.
+- [docs/security_hardening.md](docs/security_hardening.md) covers network controls, TLS, secrets and state, CMEK, org policies, deployer IAM and audit logs.
+- Report vulnerabilities as described in [SECURITY.md](SECURITY.md). Contribution rules: [CONTRIBUTING.md](CONTRIBUTING.md).
 - This is not an officially supported Google product. No support or SLA is provided.
 - Licensed under the [Apache License 2.0](LICENSE).

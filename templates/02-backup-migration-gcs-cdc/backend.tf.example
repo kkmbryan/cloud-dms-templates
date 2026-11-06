@@ -1,0 +1,65 @@
+# ------------------------------------------------------------------------------
+# Remote state in Cloud Storage, encrypted with a customer-managed key (CMEK).
+#
+# The state of this template holds secrets: the DMS source password (the native
+# DMS connection profile has no write-only password field) and, with
+# source_ssl_type = "SERVER_CLIENT", the client private key. The Cloud SQL root
+# password is NOT stored: it uses the write-only password_wo argument.
+# Keep state out of local disks and Git, and restrict who can read it.
+#
+# 1. Create a key ring and key in the same location as the bucket:
+#
+#    gcloud kms keyrings create tfstate --location=europe-west2 \
+#      --project=my-gcp-project-01
+#    gcloud kms keys create tfstate --keyring=tfstate --location=europe-west2 \
+#      --purpose=encryption --rotation-period=90d \
+#      --next-rotation-time="$(date -u -d '+90 days' +%Y-%m-%dT%H:%M:%SZ)" \
+#      --project=my-gcp-project-01
+#
+# 2. Let the Cloud Storage service agent use the key (prints
+#    service-PROJECT_NUMBER@gs-project-accounts.iam.gserviceaccount.com):
+#
+#    GCS_AGENT="$(gcloud storage service-agent --project=my-gcp-project-01 | tr -d '[:space:]')"
+#    gcloud kms keys add-iam-policy-binding tfstate --keyring=tfstate \
+#      --location=europe-west2 --project=my-gcp-project-01 \
+#      --member="serviceAccount:${GCS_AGENT}" \
+#      --role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+#
+# 3. Create the state bucket with Object Versioning (recover earlier state),
+#    uniform bucket-level access, public access prevention and the CMEK key as
+#    the default key:
+#
+#    gcloud storage buckets create gs://my-gcp-project-01-tfstate \
+#      --project=my-gcp-project-01 --location=europe-west2 \
+#      --uniform-bucket-level-access --public-access-prevention \
+#      --default-encryption-key=projects/my-gcp-project-01/locations/europe-west2/keyRings/tfstate/cryptoKeys/tfstate
+#    gcloud storage buckets update gs://my-gcp-project-01-tfstate --versioning
+#
+# 4. Restrict access to the deployer group or service account only, on this
+#    bucket only (no project-wide storage roles):
+#
+#    gcloud storage buckets add-iam-policy-binding gs://my-gcp-project-01-tfstate \
+#      --member="group:dms-deployers@example.com" \
+#      --role=roles/storage.objectAdmin
+#
+#    (or --member="serviceAccount:tf-deployer@my-gcp-project-01.iam.gserviceaccount.com")
+#
+# 5. Copy this file to backend.tf, replace the placeholders, and move any
+#    existing local state into the bucket:
+#
+#    cp backend.tf.example backend.tf
+#    terraform init -migrate-state
+#
+#    After the migration, delete the local terraform.tfstate and
+#    terraform.tfstate.backup files.
+#
+# Docs: https://developer.hashicorp.com/terraform/language/backend/gcs
+# ------------------------------------------------------------------------------
+
+terraform {
+  backend "gcs" {
+    bucket             = "my-gcp-project-01-tfstate"
+    prefix             = "cloud-dms-templates/02-backup-migration-gcs-cdc"
+    kms_encryption_key = "projects/my-gcp-project-01/locations/europe-west2/keyRings/tfstate/cryptoKeys/tfstate"
+  }
+}

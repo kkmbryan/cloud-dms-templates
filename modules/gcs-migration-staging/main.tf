@@ -19,12 +19,25 @@ resource "google_storage_bucket" "migration_staging" {
     }
   }
 
+  # Delete seed objects retention_days after upload.
   lifecycle_rule {
     action {
       type = "Delete"
     }
     condition {
       age = var.retention_days
+    }
+  }
+
+  # Versioning keeps a noncurrent copy of every overwritten or deleted object
+  # (including the seed after `gcloud storage rm`). Delete those copies too.
+  lifecycle_rule {
+    action {
+      type = "Delete"
+    }
+    condition {
+      days_since_noncurrent_time = var.noncurrent_version_retention_days
+      with_state                 = "ARCHIVED"
     }
   }
 }

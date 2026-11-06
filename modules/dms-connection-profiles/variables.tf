@@ -47,8 +47,19 @@ variable "source_password" {
   }
 }
 
+variable "source_ssl_type" {
+  description = "TLS mode from DMS to the source: REQUIRED (default: encrypted, server certificate not verified), SERVER_ONLY (verify the server certificate against source_ssl_ca_certificate), SERVER_CLIENT (also present a client certificate) or NONE (no TLS, not recommended)."
+  type        = string
+  default     = "REQUIRED"
+
+  validation {
+    condition     = contains(["NONE", "REQUIRED", "SERVER_ONLY", "SERVER_CLIENT"], var.source_ssl_type)
+    error_message = "source_ssl_type must be NONE, REQUIRED, SERVER_ONLY or SERVER_CLIENT."
+  }
+}
+
 variable "source_ssl_ca_certificate" {
-  description = "Optional x509 PEM-encoded CA certificate that signed the source MySQL server certificate."
+  description = "x509 PEM-encoded CA certificate that signed the source MySQL server certificate (SERVER_ONLY and SERVER_CLIENT)."
   type        = string
   default     = null
 }

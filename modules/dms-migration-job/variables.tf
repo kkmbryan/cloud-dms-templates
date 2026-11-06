@@ -147,3 +147,9 @@ variable "labels" {
   type        = map(string)
   default     = {}
 }
+
+variable "impersonate_service_account" {
+  description = "Optional service account that the gcloud demote step impersonates (exported as CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT). Set it to the provider's impersonate_service_account."
+  type        = string
+  default     = null
+}

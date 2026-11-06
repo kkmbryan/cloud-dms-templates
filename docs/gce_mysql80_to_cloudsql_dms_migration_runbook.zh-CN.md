@@ -152,6 +152,9 @@ GRANT SELECT ON performance_schema.keyring_component_status TO 'xtrabackup'@'loc
 > [!NOTE]
 > 对于场景 2 的 `LOGICAL` 初始数据，请使用可读取所有待迁移数据库的现有管理员账号运行 `mysqldump`（需要 `SELECT`、`SHOW VIEW`、`TRIGGER`、`EVENT`、`LOCK TABLES` 和 `RELOAD`）。请通过权限为 `0600` 的选项文件（`--defaults-extra-file`）传递凭据，切勿在命令行中使用 `--password=`。参考资料：[配置源数据库](https://cloud.google.com/database-migration/docs/mysql/configure-source-database-continuous)、[Percona XtraBackup 权限](https://docs.percona.com/percona-xtrabackup/8.0/privileges.html)。
 
+> [!TIP]
+> **迁移账号的 TLS。** Terraform 默认使用 `source_ssl_type = "REQUIRED"` 进行连接，因此源端必须提供 TLS（MySQL 8.0 会在首次启动时创建自签名证书；`make preflight` 会报告 `have_ssl`，并在 TLS 不可用或未强制启用时给出 WARN）。可使用 `SET PERSIST require_secure_transport = ON;`（所有账号）或 `ALTER USER 'dms_migration'@'%' REQUIRE SSL;`（`03_create_dms_user.sql` 中被注释掉的选项）强制启用 TLS。按照 DMS 文档的要求保持主机部分为 `'%'`，并通过来自 Network Attachment 子网的防火墙规则限制网络路径（第 3 节）。如需验证服务器证书，请将 `source_ssl_type = "SERVER_ONLY"` 与 CA 证书配合使用（`SHOW VARIABLES LIKE 'ssl_ca';`，默认是数据目录中的 `ca.pem`）。请参阅 [security_hardening.zh-CN.md](security_hardening.zh-CN.md)。
+
 ### 2.4 运行预检
 
 在源虚拟机上运行这项只读检查，修复所有 FAIL 项，然后重新运行，直到不再报告 FAIL。没有 FAIL 时退出码为 `0`，至少一项检查失败时为 `1`，用法或连接错误时为 `2`。除上述设置外，它还会检查 DMS 用户的授权（包括不得拥有 `BACKUP_ADMIN`）、binlog 保留期是否满足 `SEED_HOURS`、非 InnoDB 表、没有主键或唯一 `NOT NULL` 键的表、DEFINER、对系统库的引用、`lower_case_table_names`、字符集与排序规则、`sql_mode`、时区、`innodb_page_size` 以及数据库大小。
@@ -169,18 +172,43 @@ MYSQL_DEFAULTS_FILE=~/.my-dms.cnf ./scripts/source-prep/preflight_check.sh \
 
 ## 3. 阶段 2：Private Service Connect (PSC) 与出站 Network Attachment 架构
 
-两个模板均默认使用 **Private Service Connect（`connectivity_type = "PSC"`，`destination_mode = "EXISTING_CLOUDSQL"`）**，以规避 VPC 对等互连的传递性限制：
+两个模板均默认使用 **Private Service Connect（`connectivity_type = "PSC"`，`destination_mode = "EXISTING_CLOUDSQL"`）**，以规避 VPC 对等互连的传递性限制。一次 `terraform apply` 会按以下顺序创建资源：
+
+```mermaid
+flowchart LR
+  A["1. Cloud SQL 实例<br/>（仅 PSC，无公共 IP）"] --> B["2. Network Attachment<br/>ACCEPT_MANUAL：租户项目<br/>来自 psc_service_attachment_link"]
+  B --> C["3. 挂接到实例<br/>(gcloud sql instances patch)"]
+  F["防火墙规则<br/>NA 子网至 tcp:3306"] --> D
+  C --> D["4. DMS 连接配置文件 + 作业<br/>+ demote-destination"]
+  A --> E["PSC 端点 + 私有 DNS<br/>（应用）"]
+```
 
 1. **Cloud SQL 纯 PSC + 出站 Network Attachment（`network_attachment_uri`）**：
-   - `cloudsql-mysql-destination` 模块会配置 `psc_enabled = true`（同时 `ipv4_enabled = false`）和 `allowed_consumer_projects`。实例创建后，模块会运行 `gcloud sql instances patch --psc-network-attachment-uri=...` 并重新读取实例；如果挂接未生效，apply 会失败。之后，目标 Cloud SQL 实例即可与您的 VPC 子网建立私有出站复制连接。
-2. **Compute Engine Network Attachment**：
-   - `networking-psc` 模块会在您的子网中预配 `google_compute_network_attachment`。未指定 `dms_tenant_project_id` 时，默认使用 `ACCEPT_AUTOMATIC`；指定 `dms_tenant_project_id` 时，则强制使用 `ACCEPT_MANUAL`，并将 `producer_accept_lists` 限制为您的项目和指定的租户项目。
-3. **原生 DMS 连接配置文件与迁移作业**：
-   - 源连接配置文件、目标连接配置文件和迁移作业均为原生 Terraform 资源。源端密码由 provider 发送到 DMS API，不会出现在命令行中。但它仍会（以敏感值形式）存储在 Terraform 状态中，因此请保护好您的状态后端。
-4. **自动降级目标实例（`demote-destination`）**：
+   - `cloudsql-mysql-destination` 模块会配置 `psc_enabled = true`（同时 `ipv4_enabled = false`）和 `allowed_consumer_projects`（托管 PSC 端点的 `project_id`，以及 `allowed_psc_consumer_projects`）。Network Attachment 创建后，模块会运行 `gcloud sql instances patch --psc-network-attachment-uri=... --async`，等待该操作完成（`gcloud sql operations wait`，默认超时 1800 秒）并重新读取实例；如果挂接未生效，apply 会失败。之后，目标 Cloud SQL 实例即可与 Network Attachment 子网建立私有出站复制连接。
+   - `psc_config` 位于 `ignore_changes` 中。它是一个集合，因此无法将 `ignore_changes` 缩小到 `network_attachment_uri`；而且由于 Network Attachment 需要先有实例（步骤 2），创建实例时也无法设置挂接。因此，Terraform 不会应用之后对 `allowed_consumer_projects` 的更改：请运行 `gcloud sql instances patch INSTANCE --allowed-psc-projects=PROJECT_1,PROJECT_2`。
+2. **Compute Engine Network Attachment（`ACCEPT_MANUAL`）**：
+   - `networking-psc` 模块会在 `network_attachment_subnet`（默认为 `subnet`）中创建 `google_compute_network_attachment`。请使用与源端子网分开的**专用小子网**（例如 `/28`；每个 PSC 接口占用一个 IP 地址）。
+   - `psc_connection_preference = "ACCEPT_MANUAL"`（默认）仅接受 Cloud SQL **租户项目**。Terraform 会在同一次 apply 中根据实例 `psc_service_attachment_link`（`projects/<tenant-project>/regions/...`）的项目段推导出该项目，因此您无需自行查找。在测试中，填写租户**项目 ID** 的接受列表被接受；随后 Network Attachment 会以租户**项目编号**（`connectionEndpoints[].projectIdOrNum`）和 `status: ACCEPTED` 列出该连接。使用以下命令检查：
+     ```bash
+     gcloud compute network-attachments describe dms-mysql-psc-na --region=europe-west2 \
+       --format="yaml(connectionPreference,producerAcceptLists,connectionEndpoints)"
+     ```
+   - 如果接受列表中不包含租户项目，挂接步骤会失败并报错 `[ERROR_NETWORK_ATTACHMENT_POLICY_FORBIDDEN] The Network Attachment connection policy is not allowing connection.`，且不会创建连接端点。修正 `psc_producer_accept_list`（或将其留空以推导租户项目）后再次 apply：Network Attachment 会被原地更新，挂接步骤会重新运行。
+   - `ACCEPT_AUTOMATIC`（可选项）会接受来自任何知道该挂接 URI 的项目的 PSC 接口。
+3. **防火墙规则（`create_source_firewall_rule = true`）**：
+   - 模块会创建一条 INGRESS 规则（`<network_attachment_name>-to-source`，已开启日志），允许来自 Network Attachment 子网 CIDR 的 `tcp:source_gce_mysql_port` 流量访问由 `source_target_tags` 或 `source_target_service_accounts`（二者选其一）选定的源虚拟机。如果没有此类规则，默认拒绝的 VPC 会导致 `verify` 失败（第 6 节）。仅当您自行管理等效规则时，才设置 `create_source_firewall_rule = false`。
+4. **到源端和到 Cloud SQL 的 TLS**：
+   - 源连接配置文件默认使用 `source_ssl_type = "REQUIRED"`（加密，不验证服务器证书）。`SERVER_ONLY` 会使用 `source_ssl_ca_certificate` 验证服务器证书；`SERVER_CLIENT` 还会发送 `source_ssl_client_certificate` 和 `source_ssl_client_key`。可在源端使用 `SET PERSIST require_secure_transport = ON;` 或 `ALTER USER 'dms_migration'@'%' REQUIRE SSL;` 强制启用 TLS（`make preflight` 会报告这两项）。
+   - `cloudsql_ssl_mode = "ENCRYPTED_ONLY"`（默认）使 Cloud SQL 拒绝未加密的客户端连接。它不影响 DMS 复制，因为复制是从 Cloud SQL 到源端的出站连接。
+   - 详细信息、CMEK、组织政策和部署者 IAM：[security_hardening.zh-CN.md](security_hardening.zh-CN.md)。
+5. **原生 DMS 连接配置文件与迁移作业**：
+   - 源连接配置文件、目标连接配置文件和迁移作业均为原生 Terraform 资源。源端密码由 provider 发送到 DMS API，不会出现在命令行中。DMS 连接配置文件没有只写密码字段，因此密码仍会（以敏感值形式）存储在 Terraform 状态中：请使用受保护的远程后端（`backend.tf.example`）。
+6. **自动降级目标实例（`demote-destination`）**：
    - 当 `destination_mode = "EXISTING_CLOUDSQL"` 时，`dms-migration-job` 模块会在作业创建后运行一次 `gcloud database-migration migration-jobs demote-destination`，等待该操作完成（默认超时 3600 秒）；如果操作报告错误，apply 会失败。
-5. **PSC 使用方端点与私有 DNS（应用访问）**：
+7. **PSC 使用方端点与私有 DNS（应用访问）**：
    - `cloudsql-psc-endpoint` 模块（默认 `create_psc_endpoint = true`）会在 `psc_endpoint_subnet` 中预留内部 IP，创建指向实例服务连接的转发规则，并在绑定到 `network` 的 `<region>.sql.goog.` 私有 Cloud DNS 区域中为实例 DNS 名称添加 A 记录。如果您的 VPC 中已存在该区域，请设置 `psc_existing_dns_zone_name`。
+8. **`local-exec` 步骤的凭据**：
+   - 挂接、分离和降级步骤会使用当前活跃的 `gcloud` 凭据调用 `gcloud`。设置 `impersonate_service_account` 可让提供程序和这些步骤使用同一个部署者服务账号（导出为 `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT`）。销毁时的分离步骤会从自身状态中读取同一设置。
 
 ---
 
@@ -303,7 +331,7 @@ DMS 不会迁移用户账号、登录信息或 `mysql` 系统数据库，也不�
 ## 6. 阶段 5：验证并启动迁移作业
 
 > [!WARNING]
-> 在 `start` 与 `promote` 之间，不要对目标实例运行 `terraform apply`。DMS 会修改目标实例的备份与恢复设置（备份、时间点恢复），使实例与 Terraform 配置不一致（在测试中，降级后的 `terraform plan` 试图重新启用自动备份），此时 apply 会尝试更改正在运行的 DMS 副本。请在提升后运行 `terraform plan` 和 `terraform apply`（第 9.1 节）。请参阅[已知限制](https://cloud.google.com/database-migration/docs/mysql/known-limitations)。
+> 在降级（创建作业的那次 apply 结束时）与 `promote` 之间，不要运行完整的 `terraform apply`。DMS 会修改目标实例的备份与恢复设置（备份、时间点恢复），使实例与 Terraform 配置不一致：在测试中，降级后的 `terraform plan` 试图重新启用自动备份，随后 `terraform apply` 在实例上失败并报错 `Invalid flag for instance role: Backups cannot be enabled for read replica instance`（API 拒绝该更改；其他资源不会被修改）。`-target=module.networking` 无法避免该问题，因为 Network Attachment 依赖于实例。如需在此期间仅更改源端防火墙规则，请直接指定该规则：`terraform apply -target='module.networking.google_compute_firewall.na_to_source[0]'`。请在提升后运行 `terraform plan` 和 `terraform apply`（第 9.1 节）。请参阅[已知限制](https://cloud.google.com/database-migration/docs/mysql/known-limitations)。
 
 1. **运行 DMS 验证**（连接性、GTID/binlog 设置，以及场景 2 的存储桶访问权限）：
    ```bash
@@ -323,6 +351,15 @@ DMS 不会迁移用户账号、登录信息或 `mysql` 系统数据库，也不�
    gcloud database-migration migration-jobs start gcs-bkp-mysql80-cdc \
      --region=europe-west2
    ```
+
+### 6.1 排查 `verify` 与 Network Attachment 问题
+
+| 现象 | 可能原因 | 解决方法 |
+| :--- | :--- | :--- |
+| `verify` 失败：`Failure connecting to the source database. Make sure the connectivity information on the connection profile is correct and the source database is reachable.` | 没有防火墙规则允许 Network Attachment 子网访问源虚拟机上的 `tcp:3306`（测试中通过设置 `create_source_firewall_rule = false` 复现）。其他原因：`source_gce_mysql_host` 错误、`bind_address` 绑定在环回地址上，或 MySQL 未在监听。 | 保持 `create_source_firewall_rule = true` 并设置正确的 `source_target_tags` 或 `source_target_service_accounts`，或添加等效规则。检查 `make preflight`（`bind_address`）。 |
+| `terraform apply` 在挂接步骤失败：`[ERROR_NETWORK_ATTACHMENT_POLICY_FORBIDDEN] The Network Attachment connection policy is not allowing connection.` | `ACCEPT_MANUAL` 接受列表中不包含 Cloud SQL 租户项目（例如 `psc_producer_accept_list` 填写错误）。 | 将 `psc_producer_accept_list` 留空（从实例推导）或修正它，然后再次 apply。 |
+| `verify` 因 TLS 失败，或 `make preflight` 对 `tls` 给出 WARN | 源端未提供 TLS（`have_ssl` 不是 `YES`），而 `source_ssl_type = "REQUIRED"`；或使用 `SERVER_ONLY` 时 CA 不正确。 | 在源端配置 TLS，或提供签发服务器证书的 CA。仅在万不得已时使用 `source_ssl_type = "NONE"`。 |
+| 降级与提升之间完整的 `terraform apply` 失败：`Backups cannot be enabled for read replica instance` | DMS 在已降级的目标实例上引入的配置偏差（请参阅上方警告）。 | 提升之前不要对实例执行 apply；如确有必要，仅指定防火墙规则。 |
 
 ---
 
@@ -411,7 +448,7 @@ DMS 不会迁移用户账号、登录信息或 `mysql` 系统数据库，也不�
 5. **切换应用连接端点**：
    - 将连接字符串指向 PSC 端点 DNS 名称（Terraform 输出 `psc_endpoint_dns_name`）。Terraform 创建的私有区域会在 `network` 内将其解析为 PSC 端点 IP（`psc_endpoint_ip_address`）。在应用主机上测试：
      ```bash
-     mysql --host="<psc_endpoint_dns_name>" --user="<app_user>" -p -e "SELECT @@hostname, @@version;"
+     mysql --host="<psc_endpoint_dns_name>" --ssl-mode=REQUIRED --user="<app_user>" -p -e "SELECT @@hostname, @@version;"
      ```
 
 ---
@@ -429,6 +466,8 @@ terraform apply tfplan
 
 不要应用会替换或销毁 `module.cloudsql_destination` 的计划。如需保留 Cloud SQL 并下线迁移相关对象，请改为按照第 10.2 节操作。
 
+这也是启用 `cloudsql_password_validation_policy`（例如 `{ min_length = 14 }`）的时机：如果在创建实例时设置该策略，API 会拒绝创建实例（`Root user's password is not policy compliant`），因为 root 密码是之后才由只写的 `google_sql_user` 设置的。在测试中，在已提升的实例上启用该策略可以成功，之后的 plan 显示没有更改。客户端连接必须使用 TLS（`cloudsql_ssl_mode = "ENCRYPTED_ONLY"`）：在测试中，通过 PSC 端点使用 `mysql --ssl-mode=DISABLED` 被拒绝，报错 `ERROR 1045 (28000): Access denied`。
+
 ### 9.2 主版本升级路径
 
 - 如果您迁移到了 **`MYSQL_8_0`**（例如为了保留第 8.2 节中的回退能力），可以将 `target_database_version = "MYSQL_8_4"` 后运行 `terraform apply`，或使用 `gcloud sql instances patch --database-version`，将实例就地升级到 **`MYSQL_8_4`**。如果栈中仍包含迁移相关对象，请先将其下线（第 10.2 节），使升级计划只涉及实例本身。在模板 02 中，`dump_type = "PHYSICAL"` 的验证会拒绝 `target_database_version = "MYSQL_8_4"`：请在更改版本之前设置 `dump_type = "LOGICAL"`，或移除栈中的 DMS 对象。
@@ -440,21 +479,19 @@ terraform apply tfplan
 ## 10. 清理与下线
 
 > [!CAUTION]
-> `gcloud database-migration migration-jobs delete` 总是会连同作业一起删除目标连接配置文件；如果使用 `--force`，还会删除目标 Cloud SQL 副本数据库。切勿对生产迁移使用 `--force`。请通过 `gcloud database-migration migration-jobs delete --help` 确认。
+> `gcloud database-migration migration-jobs delete` 总是会连同作业一起删除目标连接配置文件；如果使用 `--force`，还会删除目标 Cloud SQL 副本数据库。切勿对生产迁移使用 `--force`。Terraform 从不设置 `--force`。请通过 `gcloud database-migration migration-jobs delete --help` 确认。
+
+> [!WARNING]
+> **在提升之前删除作业即放弃迁移。** 在测试中，DMS 接受了对处于 CDC 阶段的 `RUNNING` 作业的删除（状态变为 `DELETING`，随后与目标连接配置文件一起消失）。目标实例仍是外部源端的只读副本（`instanceType: READ_REPLICA_INSTANCE`）。请使用 `gcloud sql instances promote-replica INSTANCE` 将其提升，或将其删除。`terraform destroy` 的行为相同。迁移被放弃后，即使 Terraform 删除了副本，DMS 也会留下源表示实例 `<instance>-master`（类型为 `ON_PREMISES_INSTANCE`）；请使用 `gcloud sql instances delete <instance>-master` 将其删除。在测试中，正常提升后该实例会被自动移除。
 
 ### 10.1 测试环境
 
-1. **先删除迁移作业**，使 `terraform destroy` 不必依赖 DMS 释放目标实例：
-   ```bash
-   gcloud database-migration migration-jobs delete gce-live-mysql80-cdc \
-     --region=europe-west2
-   ```
-2. **关闭删除保护**：在 `terraform.tfvars` 中设置 `cloudsql_deletion_protection = false`，然后运行 `terraform apply`。
-3. **销毁整个栈**：
+1. **关闭删除保护**：在 `terraform.tfvars` 中设置 `cloudsql_deletion_protection = false`，然后运行 `terraform apply`（在提升之后；对于已降级的副本，请参阅第 6 节）。
+2. **销毁整个栈**。Terraform 会删除作业（即使作业仍在运行）和连接配置文件，将 Network Attachment 与实例分离（这会重启实例；测试中约 5 分钟），然后删除 Network Attachment、防火墙规则、PSC 端点和实例：
    ```bash
    terraform destroy
    ```
-4. **最后删除暂存存储桶**（场景 2）。该存储桶启用了版本控制；除非设置了 `staging_bucket_force_destroy = true`，否则在存储桶仍有对象时 `terraform destroy` 无法删除它。请先删除对象，然后再次运行 `terraform destroy`：
+3. **最后删除暂存存储桶**（场景 2）。该存储桶启用了版本控制；除非设置了 `staging_bucket_force_destroy = true`，否则在存储桶仍有对象时 `terraform destroy` 无法删除它。请先删除对象，然后再次运行 `terraform destroy`：
    ```bash
    gcloud storage rm --recursive --all-versions "gs://my-dms-staging-bucket/**"
    terraform destroy
@@ -462,25 +499,39 @@ terraform apply tfplan
 
 ### 10.2 切换后的生产环境
 
-保留 Cloud SQL 实例，只下线迁移相关对象：DMS 作业、连接配置文件和 Network Attachment。
+保留 Cloud SQL 实例、PSC 端点和 DNS 记录，仅使用 **`migration_enabled = false`** 下线迁移相关对象。请仅在提升之后（作业状态为 `COMPLETED`）使用：在提升之前，完整的 apply 会在已降级的副本上失败（第 6 节）。
 
-1. **将 Network Attachment 与实例分离**。实例仍在使用 Network Attachment 时无法将其删除。此操作**会重启实例**（在测试中约耗时 5 分钟），因此请在维护窗口内执行：
+```mermaid
+flowchart LR
+  A["已提升（COMPLETED）<br/>应用使用 PSC 端点"] --> B["terraform plan<br/>-var migration_enabled=false"]
+  B --> C["删除 DMS 作业、<br/>连接配置文件、降级步骤"]
+  B --> D["分离 Network Attachment<br/>（实例重启）"]
+  D --> E["删除 Network Attachment"]
+  B --> F["删除源端防火墙规则"]
+  C --> G["保留：Cloud SQL、<br/>PSC 端点、DNS"]
+  E --> G
+  F --> G
+```
+
+1. **安排维护窗口。** 分离 Network Attachment 会**重启实例**。在测试中，分离操作约耗时 5 分钟，通过 PSC 端点连接的客户端在重启期间出现了短暂中断。
+2. **检查计划。** 计划只能销毁 DMS 作业、连接配置文件、降级步骤、挂接步骤、Network Attachment 和源端防火墙规则，不得涉及 Cloud SQL 实例、root 用户、PSC 端点或 DNS 记录：
    ```bash
-   gcloud sql instances patch "$(terraform output -raw cloudsql_instance_name)" \
-     --clear-psc-network-attachment-uri
+   terraform plan -var migration_enabled=false -out=tfplan
    ```
-2. **将实例移出迁移栈**。先备份状态，然后从中移除实例和 PSC 端点，再将它们导入一个保持 `deletion_protection` 开启的长期栈（使用 `import` 块）：
+3. **应用该计划**，然后在 `terraform.tfvars` 中设置 `migration_enabled = false`，使之后的 apply 保持该设置：
+   ```bash
+   terraform apply tfplan
+   ```
+   Terraform 会在删除 Network Attachment 之前运行 `gcloud sql instances patch --clear-psc-network-attachment-uri`，等待操作完成，并检查 `networkAttachmentUri` 是否为空。
+4. **检查结果**：
+   ```bash
+   gcloud sql instances describe "$(terraform output -raw cloudsql_instance_name)" \
+     --format="value(state,settings.ipConfiguration.pscConfig.networkAttachmentUri)"   # RUNNABLE, empty
+   mysql --host="$(terraform output -raw psc_endpoint_dns_name)" --ssl-mode=REQUIRED --user="<app_user>" -p -e "SELECT 1;"
+   ```
+5. **场景 2：** 删除初始数据（`gcloud storage rm`，对于 `PHYSICAL` 文件夹请添加 `--recursive`）。非当前版本会在 `staging_bucket_noncurrent_version_retention_days` 天后删除。不再需要该存储桶时将其移除。
+6. **可选：将实例迁入长期栈。** 先备份状态，从迁移栈中移除实例和 PSC 端点，再将它们导入一个保持 `deletion_protection` 开启的栈（使用 `import` 块）：
    ```bash
    terraform state pull > pre-decommission.tfstate
    terraform state rm module.cloudsql_destination module.cloudsql_psc_endpoint
-   ```
-3. **不使用 `--force` 删除迁移作业**：
-   ```bash
-   gcloud database-migration migration-jobs delete gce-live-mysql80-cdc \
-     --region=europe-west2
-   ```
-4. **销毁剩余的迁移对象**（连接配置文件、Network Attachment，以及场景 2 的存储桶）。请先检查计划：其中不得包含 Cloud SQL 实例。
-   ```bash
-   terraform plan -destroy
-   terraform destroy
    ```

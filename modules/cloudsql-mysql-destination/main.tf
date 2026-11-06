@@ -42,6 +42,10 @@ resource "google_sql_database_instance" "destination" {
   database_version    = var.database_version
   deletion_protection = var.deletion_protection
 
+  # CMEK (optional). Set at creation only; the key must be in the same region and
+  # the Cloud SQL service agent needs roles/cloudkms.cryptoKeyEncrypterDecrypter.
+  encryption_key_name = var.kms_key_name
+
   # The root password is applied by google_sql_user.root below with a
   # write-only argument (Terraform >= 1.11), so it is not stored in Terraform
   # state. A saved plan file (terraform plan -out) still contains root module
@@ -65,6 +69,7 @@ resource "google_sql_database_instance" "destination" {
     ip_configuration {
       ipv4_enabled    = var.enable_ipv4
       private_network = var.connectivity_type == "PSA" ? var.private_network : null
+      ssl_mode        = var.ssl_mode
 
       dynamic "psc_config" {
         for_each = var.connectivity_type == "PSC" ? [1] : []
@@ -86,6 +91,18 @@ resource "google_sql_database_instance" "destination" {
       }
     }
 
+    dynamic "password_validation_policy" {
+      for_each = var.password_validation_policy == null ? [] : [var.password_validation_policy]
+      content {
+        enable_password_policy      = true
+        min_length                  = password_validation_policy.value.min_length
+        complexity                  = password_validation_policy.value.complexity
+        reuse_interval              = password_validation_policy.value.reuse_interval
+        disallow_username_substring = password_validation_policy.value.disallow_username_substring
+        password_change_interval    = password_validation_policy.value.password_change_interval
+      }
+    }
+
     dynamic "database_flags" {
       for_each = local.merged_database_flags
       content {
@@ -95,6 +112,14 @@ resource "google_sql_database_instance" "destination" {
     }
   }
 
+  # psc_config is a set, so ignore_changes can't be narrowed to
+  # network_attachment_uri: the whole block is ignored after creation.
+  # - network_attachment_uri: the Network Attachment is created after the
+  #   instance (ACCEPT_MANUAL needs the tenant project from this instance), so
+  #   terraform_data.psc_outbound_network_attachment below owns it.
+  # - allowed_consumer_projects: applied at creation. To change it later, run
+  #   `gcloud sql instances patch INSTANCE --allowed-psc-projects=...`
+  #   (see docs/security_hardening.md).
   lifecycle {
     ignore_changes = [
       settings[0].ip_configuration[0].psc_config
@@ -129,6 +154,15 @@ resource "google_sql_user" "root" {
 # that Cloud SQL (and DMS replication) can reach the source in the consumer VPC.
 # psc_config is in ignore_changes above, so this step is the single owner of
 # networkAttachmentUri. It fails the apply if the patch does not take effect.
+#
+# On destroy (psc_outbound_enabled = false, migration_enabled = false, or
+# terraform destroy) it clears the attachment from the instance first, so that
+# the Network Attachment can be deleted. Clearing it RESTARTS the instance:
+# plan it in a maintenance window on a promoted production instance.
+#
+# gcloud runs with the active gcloud credentials. To use the same identity as
+# the provider, set impersonate_service_account (exported to gcloud as
+# CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT).
 # ------------------------------------------------------------------------------
 resource "terraform_data" "psc_outbound_network_attachment" {
   # Use a plan-time boolean: the attachment URI itself is unknown until the
@@ -136,6 +170,7 @@ resource "terraform_data" "psc_outbound_network_attachment" {
   count = var.enabled && var.connectivity_type == "PSC" && var.psc_outbound_enabled ? 1 : 0
 
   triggers_replace = [
+    var.project_id,
     google_sql_database_instance.destination[0].name,
     local.psc_network_attachment_uri,
   ]
@@ -151,12 +186,17 @@ resource "terraform_data" "psc_outbound_network_attachment" {
     project_id                 = var.project_id
     instance_name              = google_sql_database_instance.destination[0].name
     psc_network_attachment_uri = local.psc_network_attachment_uri
+    timeout_seconds            = var.operation_timeout_seconds
+    impersonate_sa             = var.impersonate_service_account == null ? "" : var.impersonate_service_account
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -euo pipefail
+      if [ -n "${self.input.impersonate_sa}" ]; then
+        export CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT="${self.input.impersonate_sa}"
+      fi
       PROJECT="${self.input.project_id}"
       INSTANCE="${self.input.instance_name}"
       WANT="${self.input.psc_network_attachment_uri}"
@@ -169,8 +209,13 @@ resource "terraform_data" "psc_outbound_network_attachment" {
 
       if [ "$(current_na)" != "$${WANT}" ]; then
         echo "Attaching network attachment $${WANT} to Cloud SQL instance $${INSTANCE}..."
-        gcloud sql instances patch "$${INSTANCE}" --project="$${PROJECT}" \
-          --psc-network-attachment-uri="$${WANT}" --quiet
+        OP=$(gcloud sql instances patch "$${INSTANCE}" --project="$${PROJECT}" \
+          --psc-network-attachment-uri="$${WANT}" --async --quiet --format="value(name)")
+        if [ -z "$${OP}" ]; then
+          echo "ERROR: instances patch returned no operation name." >&2
+          exit 1
+        fi
+        gcloud sql operations wait "$${OP}" --project="$${PROJECT}" --timeout="${self.input.timeout_seconds}"
       fi
 
       ACTUAL="$(current_na)"
@@ -179,6 +224,55 @@ resource "terraform_data" "psc_outbound_network_attachment" {
         exit 1
       fi
       echo "Network attachment verified on $${INSTANCE}."
+    EOT
+  }
+
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      if [ -n "${self.input.impersonate_sa}" ]; then
+        export CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT="${self.input.impersonate_sa}"
+      fi
+      PROJECT="${self.input.project_id}"
+      INSTANCE="${self.input.instance_name}"
+
+      # The instance may already be gone (deleted outside Terraform). Only that
+      # case is skipped; any other describe error fails the destroy.
+      if ! NAMES=$(gcloud sql instances list --project="$${PROJECT}" \
+          --filter="name=$${INSTANCE}" --format="value(name)"); then
+        echo "ERROR: could not list Cloud SQL instances in $${PROJECT}." >&2
+        exit 1
+      fi
+      if [ -z "$${NAMES}" ]; then
+        echo "Instance $${INSTANCE} not found; nothing to detach."
+        exit 0
+      fi
+
+      CURRENT=$(gcloud sql instances describe "$${INSTANCE}" --project="$${PROJECT}" \
+        --format="value(settings.ipConfiguration.pscConfig.networkAttachmentUri)")
+      if [ -z "$${CURRENT}" ]; then
+        echo "No network attachment on $${INSTANCE}; nothing to detach."
+        exit 0
+      fi
+
+      echo "Clearing the network attachment from $${INSTANCE} (the instance restarts)..."
+      OP=$(gcloud sql instances patch "$${INSTANCE}" --project="$${PROJECT}" \
+        --clear-psc-network-attachment-uri --async --quiet --format="value(name)")
+      if [ -z "$${OP}" ]; then
+        echo "ERROR: instances patch returned no operation name." >&2
+        exit 1
+      fi
+      gcloud sql operations wait "$${OP}" --project="$${PROJECT}" --timeout="${self.input.timeout_seconds}"
+
+      AFTER=$(gcloud sql instances describe "$${INSTANCE}" --project="$${PROJECT}" \
+        --format="value(settings.ipConfiguration.pscConfig.networkAttachmentUri)")
+      if [ -n "$${AFTER}" ]; then
+        echo "ERROR: networkAttachmentUri is still '$${AFTER}'." >&2
+        exit 1
+      fi
+      echo "Network attachment cleared from $${INSTANCE}."
     EOT
   }
 }

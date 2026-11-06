@@ -25,6 +25,12 @@ variable "retention_days" {
   default     = 14
 }
 
+variable "noncurrent_version_retention_days" {
+  description = "Days after which noncurrent (overwritten or deleted) object versions are deleted."
+  type        = number
+  default     = 7
+}
+
 variable "reader_members" {
   description = "Map of static label => principal that gets read access (roles/storage.objectViewer + roles/storage.legacyBucketReader) on the bucket. Values can be a bare service account email or a full IAM member string (for example serviceAccount:..., group:...). Use static keys such as \"cloudsql_instance_sa\" and \"dms_service_agent\"."
   type        = map(string)
@@ -38,7 +44,7 @@ variable "backup_writer_members" {
 }
 
 variable "kms_key_name" {
-  description = "Optional Cloud KMS crypto key resource ID for Customer-Managed Encryption Keys (CMEK) on the staging bucket."
+  description = "Optional Cloud KMS crypto key resource ID for Customer-Managed Encryption Keys (CMEK) on the staging bucket. The Cloud Storage service agent needs roles/cloudkms.cryptoKeyEncrypterDecrypter on the key."
   type        = string
   default     = null
 }

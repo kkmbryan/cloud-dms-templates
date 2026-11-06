@@ -11,6 +11,8 @@ This root Terraform template deploys a **Backup-Seeded Continuous Change Data Ca
 - **You Control the Initial Seed**: Instead of a DMS-managed dump, you create a **`mysqldump` file (`LOGICAL`, default)** or a **prepared Percona XtraBackup (`PHYSICAL`)** on your own schedule and upload it to a regional **Cloud Storage (GCS)** staging bucket.
 - **Seed + Automatic GTID CDC Resumption**: DMS restores the seed from `dump_path`, reads the GTID position recorded in the backup, and then replicates ongoing **binlog CDC** changes from the live source until cutover.
 - **Automatic Bucket IAM**: The DMS service agent and the Cloud SQL instance service account get `roles/storage.objectViewer` + `roles/storage.legacyBucketReader`; `backup_writer_members` get `roles/storage.objectCreator` + `roles/storage.objectViewer`. You don't type the service agent email. In `DMS_MANAGED_CLOUDSQL` mode, DMS creates the instance after apply, so grant its service account both reader roles yourself before `verify`: `gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer` (repeat with `roles/storage.legacyBucketReader`).
+- **Locked-Down Replication Path**: `ACCEPT_MANUAL` Network Attachment (Cloud SQL tenant project only, derived in the same apply), a logged firewall rule from the Network Attachment subnet to the source port, TLS to the source (`source_ssl_type = "REQUIRED"`) and `cloudsql_ssl_mode = "ENCRYPTED_ONLY"`. See [docs/security_hardening.md](../../docs/security_hardening.md).
+- **Bucket Retention and CMEK**: Seed objects are deleted after `staging_bucket_retention_days`, and noncurrent versions after `staging_bucket_noncurrent_version_retention_days`. Set `staging_bucket_kms_key_name` for CMEK.
 - **Strict Terraform Schema Compliance (`dump_path` vs. `dump_flags`)**: Enforces the Google Terraform Provider requirement that `dump_path` and `dump_flags` are mutually exclusive on `google_database_migration_service_migration_job`.
 
 ### Support Matrix
@@ -28,7 +30,8 @@ This root Terraform template deploys a **Backup-Seeded Continuous Change Data Ca
 flowchart LR
     subgraph GCE_VPC["Customer VPC"]
         GCE["Compute Engine VM: self-managed MySQL 8.0<br/>(GTID=ON, ROW binlog)"]
-        NA["PSC Network Attachment<br/>(dms-mysql-psc-na)"]
+        NA["PSC Network Attachment<br/>(ACCEPT_MANUAL, dedicated subnet)"]
+        FW["Firewall rule<br/>(NA subnet to tcp:3306, logged)"]
         EP["PSC endpoint + private DNS"]
     end
 
@@ -47,7 +50,8 @@ flowchart LR
     GCE -->|"Step 1: upload the seed<br/>(mysqldump or xtrabackup_to_gcs.sh)"| GCS
     GCS -->|"Step 2: restore initial seed<br/>(dump_path)"| CSQL
     CSQL -->|"PSC interface: network_attachment_uri"| NA
-    NA -->|"Internal routing (port 3306)"| GCE
+    NA --> FW
+    FW -->|"TLS (source_ssl_type), port 3306"| GCE
     GCE -->|"Step 3: continuous GTID binlog CDC"| CSQL
     JOB -->|"Orchestrates seed, demote and CDC"| CSQL
     EP -->|"Applications after promotion"| CSQL
@@ -61,12 +65,13 @@ Complete the [Prerequisites](../../README.md#3-prerequisites) (including `gcloud
 
 ### 1. Configure Variables
 
-Copy `terraform.tfvars.example` to `terraform.tfvars` and set the project, network, `dump_type` and `backup_gcs_path`. Pass passwords as environment variables:
+Copy `terraform.tfvars.example` to `terraform.tfvars` and set the project, network, `network_attachment_subnet`, `source_target_tags` (or `source_target_service_accounts`), `dump_type` and `backup_gcs_path`. Pass passwords as environment variables (for example from Secret Manager), and keep state in a remote backend ([`backend.tf.example`](backend.tf.example)):
 
 ```bash
 cp terraform.tfvars.example terraform.tfvars
-export TF_VAR_cloudsql_root_password='REPLACE_ME'
-export TF_VAR_source_gce_mysql_password='REPLACE_ME_MAX_32_CHARS'
+cp backend.tf.example backend.tf   # edit the bucket and KMS key
+export TF_VAR_cloudsql_root_password="$(gcloud secrets versions access latest --secret=cloudsql-root-password)"
+export TF_VAR_source_gce_mysql_password="$(gcloud secrets versions access latest --secret=dms-source-password)"
 ```
 
 ### 2. Initialize, Validate, and Apply Infrastructure
@@ -129,4 +134,13 @@ gcloud database-migration migration-jobs promote gcs-bkp-mysql80-cdc \
   --region=europe-west2
 ```
 
-Then point applications to the `psc_endpoint_dns_name` Terraform output, and run `terraform plan`/`apply` (runbook section 9.1). For teardown and decommission (delete the staging bucket last), see runbook section 10.
+Then point applications to the `psc_endpoint_dns_name` Terraform output, and run `terraform plan`/`apply` (runbook section 9.1). Delete the seed once you no longer need it for a re-run (`gcloud storage rm "$(terraform output -raw configured_dump_path)"`, add `--recursive` for a `PHYSICAL` folder); the lifecycle rule removes the noncurrent version later. For teardown and decommission (delete the staging bucket last), see runbook section 10.
+
+### 6. Retire the Migration Objects
+
+After promotion, set `migration_enabled = false` and apply. Terraform deletes the DMS job, the connection profiles, the demote step, the Network Attachment and the source firewall rule; Cloud SQL, the PSC endpoint and DNS stay. Detaching the Network Attachment **restarts the instance**, so run it in a maintenance window (runbook section 10.2).
+
+```bash
+terraform plan -var migration_enabled=false -out=tfplan   # Review: Cloud SQL, endpoint and DNS are not destroyed
+terraform apply tfplan
+```

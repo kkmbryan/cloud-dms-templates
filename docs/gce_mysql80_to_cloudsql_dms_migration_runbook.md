@@ -152,6 +152,9 @@ GRANT SELECT ON performance_schema.keyring_component_status TO 'xtrabackup'@'loc
 > [!NOTE]
 > For the Scenario 2 `LOGICAL` seed, run `mysqldump` with an existing administrative account that can read every migrated database (it needs `SELECT`, `SHOW VIEW`, `TRIGGER`, `EVENT`, `LOCK TABLES` and `RELOAD`). Pass credentials through a `0600` option file (`--defaults-extra-file`), never with `--password=` on the command line. References: [Configure your source database](https://cloud.google.com/database-migration/docs/mysql/configure-source-database-continuous), [Percona XtraBackup privileges](https://docs.percona.com/percona-xtrabackup/8.0/privileges.html).
 
+> [!TIP]
+> **TLS for the migration account.** Terraform connects with `source_ssl_type = "REQUIRED"` by default, so the source must offer TLS (MySQL 8.0 creates a self-signed certificate at first start; `make preflight` reports `have_ssl` and WARNs when TLS isn't available or isn't enforced). Enforce it with `SET PERSIST require_secure_transport = ON;` (all accounts) or `ALTER USER 'dms_migration'@'%' REQUIRE SSL;` (the commented option in `03_create_dms_user.sql`). Keep the host `'%'` as the DMS doc requires, and restrict the network path with the firewall rule from the Network Attachment subnet (section 3). To verify the server certificate, use `source_ssl_type = "SERVER_ONLY"` with the CA certificate (`SHOW VARIABLES LIKE 'ssl_ca';`, by default `ca.pem` in the data directory). See [security_hardening.md](security_hardening.md).
+
 ### 2.4 Run the Pre-Flight Check
 
 Run the read-only check on the source VM, fix every FAIL, and run it again until it reports no FAIL. It exits `0` when there is no FAIL, `1` when at least one check fails, and `2` on a usage or connection error. Besides the settings above, it checks the grants of the DMS user (including no `BACKUP_ADMIN`), binlog retention against `SEED_HOURS`, non-InnoDB tables, tables without a primary key or a unique `NOT NULL` key, DEFINERs, references to system schemas, `lower_case_table_names`, character set and collation, `sql_mode`, time zone, `innodb_page_size` and database size.
@@ -169,18 +172,43 @@ MYSQL_DEFAULTS_FILE=~/.my-dms.cnf ./scripts/source-prep/preflight_check.sh \
 
 ## 3. Phase 2: Private Service Connect (PSC) & Outbound Network Attachment Architecture
 
-Both templates default to **Private Service Connect (`connectivity_type = "PSC"`, `destination_mode = "EXISTING_CLOUDSQL"`)** to avoid transitive VPC peering limitations:
+Both templates default to **Private Service Connect (`connectivity_type = "PSC"`, `destination_mode = "EXISTING_CLOUDSQL"`)** to avoid transitive VPC peering limitations. One `terraform apply` creates the resources in this order:
+
+```mermaid
+flowchart LR
+  A["1. Cloud SQL instance<br/>(PSC only, no public IP)"] --> B["2. Network Attachment<br/>ACCEPT_MANUAL: tenant project<br/>from psc_service_attachment_link"]
+  B --> C["3. Attach to the instance<br/>(gcloud sql instances patch)"]
+  F["Firewall rule<br/>NA subnet to tcp:3306"] --> D
+  C --> D["4. DMS profiles + job<br/>+ demote-destination"]
+  A --> E["PSC endpoint + private DNS<br/>(applications)"]
+```
 
 1. **Cloud SQL Pure PSC + Outbound Network Attachment (`network_attachment_uri`)**:
-   - The `cloudsql-mysql-destination` module configures `psc_enabled = true` (with `ipv4_enabled = false`) and `allowed_consumer_projects`. After the instance exists, it runs `gcloud sql instances patch --psc-network-attachment-uri=...` and re-reads the instance; the apply fails if the attachment is not set. The destination Cloud SQL instance then opens private outbound replication connections into your VPC subnet.
-2. **Compute Engine Network Attachment**:
-   - The `networking-psc` module provisions `google_compute_network_attachment` in your subnet. When `dms_tenant_project_id` is omitted, it defaults to `ACCEPT_AUTOMATIC`; when `dms_tenant_project_id` is specified, it enforces `ACCEPT_MANUAL` and restricts `producer_accept_lists` to your project and the specified tenant project.
-3. **Native DMS Connection Profiles & Migration Job**:
-   - The source and destination connection profiles and the migration job are native Terraform resources. The source password is sent to the DMS API by the provider and never appears on a command line. It is still stored (marked sensitive) in Terraform state, so protect your state backend.
-4. **Automated Destination Demotion (`demote-destination`)**:
+   - The `cloudsql-mysql-destination` module configures `psc_enabled = true` (with `ipv4_enabled = false`) and `allowed_consumer_projects` (`project_id`, which hosts the PSC endpoint, plus `allowed_psc_consumer_projects`). After the Network Attachment exists, it runs `gcloud sql instances patch --psc-network-attachment-uri=... --async`, waits for the operation (`gcloud sql operations wait`, default timeout 1800 s) and re-reads the instance; the apply fails if the attachment is not set. The destination Cloud SQL instance then opens private outbound replication connections into the Network Attachment subnet.
+   - `psc_config` is in `ignore_changes`. It is a set, so `ignore_changes` can't be narrowed to `network_attachment_uri`, and the attachment can't be set when the instance is created, because the Network Attachment needs the instance first (step 2). Later changes to `allowed_consumer_projects` are therefore not applied by Terraform: run `gcloud sql instances patch INSTANCE --allowed-psc-projects=PROJECT_1,PROJECT_2`.
+2. **Compute Engine Network Attachment (`ACCEPT_MANUAL`)**:
+   - The `networking-psc` module creates `google_compute_network_attachment` in `network_attachment_subnet` (defaults to `subnet`). Use a **dedicated small subnet** (for example a `/28`; each PSC interface takes one IP address), separate from the source subnet.
+   - `psc_connection_preference = "ACCEPT_MANUAL"` (default) accepts only the Cloud SQL **tenant project**. Terraform derives it from the project segment of the instance's `psc_service_attachment_link` (`projects/<tenant-project>/regions/...`) in the same apply, so you don't need to look it up. In testing, the accept list with the tenant **project ID** was accepted; the Network Attachment then lists the connection with the tenant **project number** (`connectionEndpoints[].projectIdOrNum`) and `status: ACCEPTED`. Check it with:
+     ```bash
+     gcloud compute network-attachments describe dms-mysql-psc-na --region=europe-west2 \
+       --format="yaml(connectionPreference,producerAcceptLists,connectionEndpoints)"
+     ```
+   - If the accept list doesn't contain the tenant project, the attach step fails with `[ERROR_NETWORK_ATTACHMENT_POLICY_FORBIDDEN] The Network Attachment connection policy is not allowing connection.` and no connection endpoint is created. Fix `psc_producer_accept_list` (or leave it empty to derive the tenant project) and apply again: the Network Attachment is updated in place and the attach step runs again.
+   - `ACCEPT_AUTOMATIC` (opt-in) accepts a PSC interface from any project that knows the attachment URI.
+3. **Firewall Rule (`create_source_firewall_rule = true`)**:
+   - The module creates an INGRESS rule (`<network_attachment_name>-to-source`, logging on) that allows `tcp:source_gce_mysql_port` from the Network Attachment subnet CIDR to the source VM, selected by `source_target_tags` or `source_target_service_accounts` (one of the two). Without a rule like this, a default-deny VPC fails `verify` (section 6). Set `create_source_firewall_rule = false` only if you manage an equivalent rule yourself.
+4. **TLS to the Source and to Cloud SQL**:
+   - The source connection profile uses `source_ssl_type = "REQUIRED"` by default (encrypted, server certificate not verified). `SERVER_ONLY` verifies the server certificate against `source_ssl_ca_certificate`; `SERVER_CLIENT` also sends `source_ssl_client_certificate` and `source_ssl_client_key`. Enforce TLS on the source with `SET PERSIST require_secure_transport = ON;` or `ALTER USER 'dms_migration'@'%' REQUIRE SSL;` (`make preflight` reports both).
+   - `cloudsql_ssl_mode = "ENCRYPTED_ONLY"` (default) makes Cloud SQL reject unencrypted client connections. It doesn't affect DMS replication, which is an outbound connection from Cloud SQL to the source.
+   - Details, CMEK, org policies and deployer IAM: [security_hardening.md](security_hardening.md).
+5. **Native DMS Connection Profiles & Migration Job**:
+   - The source and destination connection profiles and the migration job are native Terraform resources. The source password is sent to the DMS API by the provider and never appears on a command line. The DMS connection profile has no write-only password field, so the password is still stored (marked sensitive) in Terraform state: use a protected remote backend (`backend.tf.example`).
+6. **Automated Destination Demotion (`demote-destination`)**:
    - When `destination_mode = "EXISTING_CLOUDSQL"`, the `dms-migration-job` module runs `gcloud database-migration migration-jobs demote-destination` once after the job is created, waits for the operation (default timeout 3600 s) and fails the apply if the operation reports an error.
-5. **PSC Consumer Endpoint & Private DNS (Application Access)**:
+7. **PSC Consumer Endpoint & Private DNS (Application Access)**:
    - The `cloudsql-psc-endpoint` module (`create_psc_endpoint = true` by default) reserves an internal IP in `psc_endpoint_subnet`, creates a forwarding rule to the instance's service attachment, and adds an A record for the instance DNS name in a private Cloud DNS zone for `<region>.sql.goog.` bound to `network`. If your VPC already has that zone, set `psc_existing_dns_zone_name`.
+8. **Credentials of the `local-exec` Steps**:
+   - The attach, detach and demote steps call `gcloud` with the active `gcloud` credentials. Set `impersonate_service_account` to make the provider and these steps use the same deployer service account (exported as `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT`). The destroy-time detach step reads the same setting from its own state.
 
 ---
 
@@ -303,7 +331,7 @@ DMS doesn't migrate user accounts, logins or the `mysql` system database, and it
 ## 6. Phase 5: Verify and Start the Migration Job
 
 > [!WARNING]
-> Don't run `terraform apply` on the destination between `start` and `promote`. DMS modifies the backup and recovery settings (backups, point-in-time recovery) of the destination instance, so the instance differs from the Terraform configuration (in testing, `terraform plan` after demotion wanted to re-enable automated backups), and an apply would try to change a running DMS replica. Run `terraform plan` and `terraform apply` after promotion (section 9.1). See [Known limitations](https://cloud.google.com/database-migration/docs/mysql/known-limitations).
+> Don't run a full `terraform apply` between the demotion (the end of the apply that creates the job) and `promote`. DMS modifies the backup and recovery settings (backups, point-in-time recovery) of the destination instance, so the instance differs from the Terraform configuration: in testing, `terraform plan` after demotion wanted to re-enable automated backups, and `terraform apply` then failed on the instance with `Invalid flag for instance role: Backups cannot be enabled for read replica instance` (the API rejects the change; nothing else is modified). `-target=module.networking` doesn't avoid it, because the Network Attachment depends on the instance. To change only the source firewall rule in this window, target the rule itself: `terraform apply -target='module.networking.google_compute_firewall.na_to_source[0]'`. Run `terraform plan` and `terraform apply` after promotion (section 9.1). See [Known limitations](https://cloud.google.com/database-migration/docs/mysql/known-limitations).
 
 1. **Run DMS Verification** (connectivity, GTID/binlog settings and, for Scenario 2, bucket access):
    ```bash
@@ -323,6 +351,15 @@ DMS doesn't migrate user accounts, logins or the `mysql` system database, and it
    gcloud database-migration migration-jobs start gcs-bkp-mysql80-cdc \
      --region=europe-west2
    ```
+
+### 6.1 Troubleshooting `verify` and the Network Attachment
+
+| Symptom | Likely cause | Fix |
+| :--- | :--- | :--- |
+| `verify` fails: `Failure connecting to the source database. Make sure the connectivity information on the connection profile is correct and the source database is reachable.` | No firewall rule allows the Network Attachment subnet to reach `tcp:3306` on the source VM (reproduced in testing by setting `create_source_firewall_rule = false`). Also: wrong `source_gce_mysql_host`, `bind_address` on loopback, or MySQL not listening. | Keep `create_source_firewall_rule = true` with the right `source_target_tags` or `source_target_service_accounts`, or add an equivalent rule. Check `make preflight` (`bind_address`). |
+| `terraform apply` fails in the attach step: `[ERROR_NETWORK_ATTACHMENT_POLICY_FORBIDDEN] The Network Attachment connection policy is not allowing connection.` | `ACCEPT_MANUAL` accept list doesn't contain the Cloud SQL tenant project (for example a wrong `psc_producer_accept_list`). | Leave `psc_producer_accept_list` empty (derived from the instance) or fix it, then apply again. |
+| `verify` fails on TLS, or `make preflight` WARNs on `tls` | The source doesn't offer TLS (`have_ssl` not `YES`) while `source_ssl_type = "REQUIRED"`, or `SERVER_ONLY` with the wrong CA. | Configure TLS on the source, or provide the CA that signed the server certificate. Use `source_ssl_type = "NONE"` only as a last resort. |
+| Full `terraform apply` fails between demotion and promotion: `Backups cannot be enabled for read replica instance` | Drift that DMS introduced on the demoted destination (see the warning above). | Don't apply the instance until promotion; target only the firewall rule if you must. |
 
 ---
 
@@ -411,7 +448,7 @@ Perform the following sequence during the scheduled cutover window:
 5. **Repoint Application Endpoints**:
    - Point your connection strings to the PSC endpoint DNS name (`psc_endpoint_dns_name` Terraform output). The private zone created by Terraform resolves it to the PSC endpoint IP (`psc_endpoint_ip_address`) inside `network`. Test from an application host:
      ```bash
-     mysql --host="<psc_endpoint_dns_name>" --user="<app_user>" -p -e "SELECT @@hostname, @@version;"
+     mysql --host="<psc_endpoint_dns_name>" --ssl-mode=REQUIRED --user="<app_user>" -p -e "SELECT @@hostname, @@version;"
      ```
 
 ---
@@ -429,6 +466,8 @@ terraform apply tfplan
 
 Don't apply a plan that replaces or destroys `module.cloudsql_destination`. To keep Cloud SQL and retire the migration objects, follow section 10.2 instead.
 
+This is also the apply in which to turn on `cloudsql_password_validation_policy` (for example `{ min_length = 14 }`): when it is set at creation, the API rejects the instance (`Root user's password is not policy compliant`), because the root password is applied afterwards by the write-only `google_sql_user`. Enabling it on the promoted instance worked in testing, and the next plan reported no changes. Client connections must use TLS (`cloudsql_ssl_mode = "ENCRYPTED_ONLY"`): in testing, `mysql --ssl-mode=DISABLED` through the PSC endpoint was rejected with `ERROR 1045 (28000): Access denied`.
+
 ### 9.2 Major Version Upgrade Path
 
 - If you migrated to **`MYSQL_8_0`** (for example, to keep the section 8.2 fallback), you can upgrade in place to **`MYSQL_8_4`** by setting `target_database_version = "MYSQL_8_4"` and running `terraform apply`, or with `gcloud sql instances patch --database-version`. On a stack that still contains the migration objects, retire them first (section 10.2), so the upgrade plan touches only the instance. In template 02, the `dump_type = "PHYSICAL"` validation rejects `target_database_version = "MYSQL_8_4"`: set `dump_type = "LOGICAL"`, or remove the stack's DMS objects, before you change the version.
@@ -440,21 +479,19 @@ Don't apply a plan that replaces or destroys `module.cloudsql_destination`. To k
 ## 10. Teardown and Decommission
 
 > [!CAUTION]
-> `gcloud database-migration migration-jobs delete` always deletes the destination connection profile with the job, and with `--force` it also deletes the destination Cloud SQL replica database. Never use `--force` on a production migration. Check with `gcloud database-migration migration-jobs delete --help`.
+> `gcloud database-migration migration-jobs delete` always deletes the destination connection profile with the job, and with `--force` it also deletes the destination Cloud SQL replica database. Never use `--force` on a production migration. Terraform never sets `--force`. Check with `gcloud database-migration migration-jobs delete --help`.
+
+> [!WARNING]
+> **Deleting a job before promotion abandons the migration.** In testing, DMS accepted the delete of a `RUNNING` job in the CDC phase (state `DELETING`, then gone, together with the destination connection profile). The destination instance stayed a read replica of the external source (`instanceType: READ_REPLICA_INSTANCE`). Promote it with `gcloud sql instances promote-replica INSTANCE` or delete it. `terraform destroy` behaves the same way. DMS also leaves the source representation instance `<instance>-master` (type `ON_PREMISES_INSTANCE`) behind after an abandoned migration, even when Terraform deletes the replica; delete it with `gcloud sql instances delete <instance>-master`. After a normal promotion it was removed automatically in testing.
 
 ### 10.1 Test Environment
 
-1. **Delete the migration job** first, so that `terraform destroy` doesn't depend on DMS releasing the destination:
-   ```bash
-   gcloud database-migration migration-jobs delete gce-live-mysql80-cdc \
-     --region=europe-west2
-   ```
-2. **Turn off deletion protection**: set `cloudsql_deletion_protection = false` in `terraform.tfvars`, then run `terraform apply`.
-3. **Destroy the stack**:
+1. **Turn off deletion protection**: set `cloudsql_deletion_protection = false` in `terraform.tfvars`, then run `terraform apply` (after promotion; on a demoted replica, see section 6).
+2. **Destroy the stack**. Terraform deletes the job (also while it is running) and the profiles, detaches the Network Attachment from the instance (this restarts the instance; about 5 minutes in testing), and then deletes the Network Attachment, the firewall rule, the PSC endpoint and the instance:
    ```bash
    terraform destroy
    ```
-4. **Delete the staging bucket last** (Scenario 2). It is versioned; unless `staging_bucket_force_destroy = true`, `terraform destroy` can't delete it while it still holds objects. Delete the objects, then run `terraform destroy` again:
+3. **Delete the staging bucket last** (Scenario 2). It is versioned; unless `staging_bucket_force_destroy = true`, `terraform destroy` can't delete it while it still holds objects. Delete the objects, then run `terraform destroy` again:
    ```bash
    gcloud storage rm --recursive --all-versions "gs://my-dms-staging-bucket/**"
    terraform destroy
@@ -462,25 +499,39 @@ Don't apply a plan that replaces or destroys `module.cloudsql_destination`. To k
 
 ### 10.2 Production After Cutover
 
-Keep the Cloud SQL instance and retire only the migration objects: the DMS job, the connection profiles and the Network Attachment.
+Keep the Cloud SQL instance, the PSC endpoint and the DNS record, and retire only the migration objects with **`migration_enabled = false`**. Use it only after promotion (job state `COMPLETED`): before promotion, a full apply fails on the demoted replica (section 6).
 
-1. **Detach the Network Attachment from the instance**. The Network Attachment can't be deleted while the instance still uses it. This operation **restarts the instance** (in testing it took about 5 minutes), so run it in a maintenance window:
+```mermaid
+flowchart LR
+  A["Promoted (COMPLETED)<br/>apps on PSC endpoint"] --> B["terraform plan<br/>-var migration_enabled=false"]
+  B --> C["Delete DMS job,<br/>profiles, demote step"]
+  B --> D["Detach Network Attachment<br/>(instance restarts)"]
+  D --> E["Delete Network Attachment"]
+  B --> F["Delete source firewall rule"]
+  C --> G["Kept: Cloud SQL,<br/>PSC endpoint, DNS"]
+  E --> G
+  F --> G
+```
+
+1. **Schedule a maintenance window.** Detaching the Network Attachment **restarts the instance**. In testing, the detach operation took about 5 minutes, and clients that connect through the PSC endpoint saw a short outage during the restart.
+2. **Review the plan.** It must destroy only the DMS job, the connection profiles, the demote step, the attach step, the Network Attachment and the source firewall rule, and must not touch the Cloud SQL instance, the root user, the PSC endpoint or the DNS record:
    ```bash
-   gcloud sql instances patch "$(terraform output -raw cloudsql_instance_name)" \
-     --clear-psc-network-attachment-uri
+   terraform plan -var migration_enabled=false -out=tfplan
    ```
-2. **Move the instance out of the migration stack**. Back up the state, then remove the instance and the PSC endpoint from it, and import them into a long-lived stack (`import` blocks) that keeps `deletion_protection` on:
+3. **Apply it**, then set `migration_enabled = false` in `terraform.tfvars` so that later applies keep it:
+   ```bash
+   terraform apply tfplan
+   ```
+   Terraform runs `gcloud sql instances patch --clear-psc-network-attachment-uri` before it deletes the Network Attachment, waits for the operation and checks that `networkAttachmentUri` is empty.
+4. **Check the result**:
+   ```bash
+   gcloud sql instances describe "$(terraform output -raw cloudsql_instance_name)" \
+     --format="value(state,settings.ipConfiguration.pscConfig.networkAttachmentUri)"   # RUNNABLE, empty
+   mysql --host="$(terraform output -raw psc_endpoint_dns_name)" --ssl-mode=REQUIRED --user="<app_user>" -p -e "SELECT 1;"
+   ```
+5. **Scenario 2:** delete the seed (`gcloud storage rm`, add `--recursive` for a `PHYSICAL` folder). The noncurrent version is deleted after `staging_bucket_noncurrent_version_retention_days`. Remove the bucket when you no longer need it.
+6. **Optional: move the instance to a long-lived stack.** Back up the state, remove the instance and the PSC endpoint from the migration stack, and import them into a stack that keeps `deletion_protection` on (`import` blocks):
    ```bash
    terraform state pull > pre-decommission.tfstate
    terraform state rm module.cloudsql_destination module.cloudsql_psc_endpoint
-   ```
-3. **Delete the migration job without `--force`**:
-   ```bash
-   gcloud database-migration migration-jobs delete gce-live-mysql80-cdc \
-     --region=europe-west2
-   ```
-4. **Destroy the remaining migration objects** (connection profiles, Network Attachment, and the bucket for Scenario 2). Review the plan first: it must not contain the Cloud SQL instance.
-   ```bash
-   terraform plan -destroy
-   terraform destroy
    ```

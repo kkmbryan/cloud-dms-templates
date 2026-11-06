@@ -11,6 +11,8 @@
 - **由您控制初始数据**：不使用由 DMS 管理的转储，而是按您自己的时间安排生成 **`mysqldump` 文件（`LOGICAL`，默认）** 或 **已准备的 Percona XtraBackup（`PHYSICAL`）**，并上传到区域级 **Cloud Storage (GCS)** 暂存存储桶。
 - **初始数据填充 + 自动恢复 GTID CDC**：DMS 从 `dump_path` 恢复初始数据，读取备份中记录的 GTID 位置，然后从在线源端持续复制 **binlog CDC** 变更，直至切换。
 - **自动配置存储桶 IAM**：DMS 服务代理和 Cloud SQL 实例服务账号获得 `roles/storage.objectViewer` + `roles/storage.legacyBucketReader`；`backup_writer_members` 获得 `roles/storage.objectCreator` + `roles/storage.objectViewer`。无需手动输入服务代理的电子邮件地址。 在 `DMS_MANAGED_CLOUDSQL` 模式下，实例由 DMS 在 apply 之后创建，因此请在 `verify` 之前自行为其服务账号授予这两个读取角色：`gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer`（再使用 `roles/storage.legacyBucketReader` 重复执行一次）。
+- **收紧的复制路径**：`ACCEPT_MANUAL` Network Attachment（仅接受 Cloud SQL 租户项目，在同一次 apply 中推导得出）、一条从 Network Attachment 子网到源端端口且已记录日志的防火墙规则、到源端的 TLS（`source_ssl_type = "REQUIRED"`）以及 `cloudsql_ssl_mode = "ENCRYPTED_ONLY"`。请参阅 [docs/security_hardening.zh-CN.md](../../docs/security_hardening.zh-CN.md)。
+- **存储桶保留期与 CMEK**：初始数据对象会在 `staging_bucket_retention_days` 天后删除，非当前版本会在 `staging_bucket_noncurrent_version_retention_days` 天后删除。如需使用 CMEK，请设置 `staging_bucket_kms_key_name`。
 - **严格遵循 Terraform Schema（`dump_path` 与 `dump_flags`）**：遵循 Google Terraform Provider 的要求，即在 `google_database_migration_service_migration_job` 上 `dump_path` 与 `dump_flags` 互斥。
 
 ### 支持矩阵
@@ -28,7 +30,8 @@
 flowchart LR
     subgraph GCE_VPC["客户 VPC"]
         GCE["Compute Engine 虚拟机：自管理 MySQL 8.0<br/>(GTID=ON, ROW binlog)"]
-        NA["PSC Network Attachment<br/>(dms-mysql-psc-na)"]
+        NA["PSC Network Attachment<br/>（ACCEPT_MANUAL，专用子网）"]
+        FW["防火墙规则<br/>（NA 子网至 tcp:3306，已记录日志）"]
         EP["PSC 端点 + 私有 DNS"]
     end
 
@@ -47,7 +50,8 @@ flowchart LR
     GCE -->|"步骤 1：上传初始数据<br/>（mysqldump 或 xtrabackup_to_gcs.sh）"| GCS
     GCS -->|"步骤 2：恢复初始数据<br/>(dump_path)"| CSQL
     CSQL -->|"PSC 接口：network_attachment_uri"| NA
-    NA -->|"内部路由（端口 3306）"| GCE
+    NA --> FW
+    FW -->|"TLS（source_ssl_type），端口 3306"| GCE
     GCE -->|"步骤 3：基于 GTID 的持续 binlog CDC"| CSQL
     JOB -->|"编排初始数据填充、降级与 CDC"| CSQL
     EP -->|"提升后供应用访问"| CSQL
@@ -61,12 +65,13 @@ flowchart LR
 
 ### 1. 配置变量
 
-将 `terraform.tfvars.example` 复制为 `terraform.tfvars`，并设置项目、网络、`dump_type` 和 `backup_gcs_path`。请通过环境变量传递密码：
+将 `terraform.tfvars.example` 复制为 `terraform.tfvars`，并设置项目、网络、`network_attachment_subnet`、`source_target_tags`（或 `source_target_service_accounts`）、`dump_type` 和 `backup_gcs_path`。请通过环境变量传递密码（例如从 Secret Manager 读取），并将状态保存在远程后端中（[`backend.tf.example`](backend.tf.example)）：
 
 ```bash
 cp terraform.tfvars.example terraform.tfvars
-export TF_VAR_cloudsql_root_password='REPLACE_ME'
-export TF_VAR_source_gce_mysql_password='REPLACE_ME_MAX_32_CHARS'
+cp backend.tf.example backend.tf   # edit the bucket and KMS key
+export TF_VAR_cloudsql_root_password="$(gcloud secrets versions access latest --secret=cloudsql-root-password)"
+export TF_VAR_source_gce_mysql_password="$(gcloud secrets versions access latest --secret=dms-source-password)"
 ```
 
 ### 2. 初始化、验证并应用基础设施
@@ -129,4 +134,13 @@ gcloud database-migration migration-jobs promote gcs-bkp-mysql80-cdc \
   --region=europe-west2
 ```
 
-然后将应用指向 Terraform 输出 `psc_endpoint_dns_name`，并运行 `terraform plan`/`apply`（运维手册第 9.1 节）。如需清理与下线（最后删除暂存存储桶），请参阅运维手册第 10 节。
+然后将应用指向 Terraform 输出 `psc_endpoint_dns_name`，并运行 `terraform plan`/`apply`（运维手册第 9.1 节）。当不再需要初始数据用于重新运行时，请将其删除（`gcloud storage rm "$(terraform output -raw configured_dump_path)"`，对于 `PHYSICAL` 文件夹请添加 `--recursive`）；生命周期规则稍后会移除非当前版本。如需清理与下线（最后删除暂存存储桶），请参阅运维手册第 10 节。
+
+### 6. 下线迁移对象
+
+提升之后，设置 `migration_enabled = false` 并执行 apply。Terraform 会删除 DMS 作业、连接配置文件、降级步骤、Network Attachment 和源端防火墙规则；Cloud SQL、PSC 端点和 DNS 会保留。分离 Network Attachment 会**重启实例**，因此请在维护窗口内执行（运维手册第 10.2 节）。
+
+```bash
+terraform plan -var migration_enabled=false -out=tfplan   # Review: Cloud SQL, endpoint and DNS are not destroyed
+terraform apply tfplan
+```

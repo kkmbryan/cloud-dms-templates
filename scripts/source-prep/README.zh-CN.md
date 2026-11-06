@@ -59,6 +59,8 @@ SOURCE scripts/source-prep/03_create_dms_user.sql
 
 该文件授予场景 1 的权限：DMS 必需的权限集（`REPLICATION SLAVE`、`REPLICATION CLIENT`、`EXECUTE`、`SELECT`、`SHOW VIEW`、`TRIGGER`、`RELOAD`），以及推荐的额外权限 `EVENT` 和 `LOCK TABLES`（用于事件 / 并行转储）。对于场景 2，请先注释掉场景 1 的 `GRANT`，并取消注释场景 2 的 `GRANT`。仅当设置了 `@xtrabackup_password` 时才会创建 `xtrabackup` 用户。不要向 `dms_migration` 授予 `BACKUP_ADMIN`，也不需要执行 `FLUSH PRIVILEGES`。
 
+如需要求迁移账号使用 TLS，请在该文件中取消注释 `ALTER USER 'dms_migration'@'%' REQUIRE SSL;`，或使用 `SET PERSIST require_secure_transport = ON;` 对所有账号强制启用 TLS。主机部分保持为 `'%'`，因为 DMS 文档就是这样创建该用户的；模板中的防火墙规则会将 3306 端口限制为仅允许 Network Attachment 子网访问。
+
 ---
 
 ## 4. 运行预检
@@ -120,6 +122,7 @@ make preflight MYSQL_DEFAULTS_FILE=~/.my-dms.cnf SCENARIO=2 \
 | `enforce_gtid_consistency` | 不是 `ON` | — |
 | `binlog_retention` | 保留时间 < 初始数据耗时（`binlog_expire_logs_seconds`；当其为 `0` 时使用 `expire_logs_days` × 86400） | < 初始数据耗时 + 24 小时缓冲，或 < 7 天 |
 | `dms_user_grants` | 用户 `'<dms-user>'@'%'` 不存在、缺少场景必需的权限，或存在 `BACKUP_ADMIN` | 授予了 `ALL PRIVILEGES`，或缺少场景 1 推荐的额外权限 `EVENT` / `LOCK TABLES` |
+| `tls` | — | TLS 不可用（`have_ssl` 不是 `YES`；此时 Terraform 默认的 `source_ssl_type = "REQUIRED"` 会导致 `verify` 失败），或 TLS 可用但未强制启用（`require_secure_transport = OFF` 且 DMS 用户没有 `REQUIRE SSL`） |
 | `non_innodb_tables` | — | 存在非 InnoDB 的用户表 |
 | `primary_keys` | — | 存在没有主键或唯一 `NOT NULL` 键的用户表 |
 | `definers` | — | 事件、例程、触发器或视图的 DEFINER 不存在或为 `root@localhost` |

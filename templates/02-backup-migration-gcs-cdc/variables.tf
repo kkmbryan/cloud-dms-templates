@@ -37,8 +37,55 @@ variable "network_attachment_name" {
   default     = "dms-mysql-psc-na"
 }
 
-variable "dms_tenant_project_id" {
-  description = "Optional Google-managed DMS/Cloud SQL tenant project ID (e.g., 'p123456-abcdef-tp') to add to the PSC Network Attachment producer_accept_lists."
+variable "network_attachment_subnet" {
+  description = "Optional dedicated subnet (self-link or ID) for the PSC Network Attachment, for example a /28 used only by the attachment. The firewall rule trusts this subnet's CIDR. Defaults to var.subnet when empty."
+  type        = string
+  default     = ""
+}
+
+variable "psc_connection_preference" {
+  description = "Network Attachment connection preference. ACCEPT_MANUAL (default) accepts only the Cloud SQL tenant project, derived from the instance's psc_service_attachment_link (or psc_producer_accept_list). ACCEPT_AUTOMATIC (opt-in) accepts any producer project that knows the attachment URI."
+  type        = string
+  default     = "ACCEPT_MANUAL"
+
+  validation {
+    condition     = contains(["ACCEPT_MANUAL", "ACCEPT_AUTOMATIC"], var.psc_connection_preference)
+    error_message = "psc_connection_preference must be either \"ACCEPT_MANUAL\" or \"ACCEPT_AUTOMATIC\"."
+  }
+}
+
+variable "psc_producer_accept_list" {
+  description = "Optional override of the ACCEPT_MANUAL producer accept list (project IDs). Leave empty (recommended) to derive the Cloud SQL tenant project from the instance."
+  type        = list(string)
+  default     = []
+}
+
+variable "allowed_psc_consumer_projects" {
+  description = "Additional application projects allowed to create PSC endpoints to the Cloud SQL instance. project_id (which hosts the endpoint created here) is always allowed. Applied when the instance is created."
+  type        = list(string)
+  default     = []
+}
+
+variable "create_source_firewall_rule" {
+  description = "Create an INGRESS firewall rule (logging on) that allows tcp:source_gce_mysql_port from the Network Attachment subnet to the source VM. Set source_target_tags or source_target_service_accounts."
+  type        = bool
+  default     = true
+}
+
+variable "source_target_tags" {
+  description = "Network tags of the source MySQL VM (firewall rule target). Set this or source_target_service_accounts."
+  type        = list(string)
+  default     = []
+}
+
+variable "source_target_service_accounts" {
+  description = "Service account emails of the source MySQL VM (firewall rule target). Set this or source_target_tags."
+  type        = list(string)
+  default     = []
+}
+
+variable "source_firewall_rule_name" {
+  description = "Name of the source firewall rule. Defaults to '<network_attachment_name>-to-source'."
   type        = string
   default     = ""
 }
@@ -305,4 +352,95 @@ variable "labels" {
     scenario    = "backup-gcs-cdc"
     managed_by  = "terraform"
   }
+}
+
+# Source TLS (DMS -> source MySQL)
+variable "source_ssl_type" {
+  description = "TLS mode from DMS to the source: REQUIRED (default: encrypted, server certificate not verified), SERVER_ONLY (verify against source_ssl_ca_certificate), SERVER_CLIENT (also send a client certificate) or NONE (not recommended)."
+  type        = string
+  default     = "REQUIRED"
+
+  validation {
+    condition     = contains(["NONE", "REQUIRED", "SERVER_ONLY", "SERVER_CLIENT"], var.source_ssl_type)
+    error_message = "source_ssl_type must be NONE, REQUIRED, SERVER_ONLY or SERVER_CLIENT."
+  }
+}
+
+variable "source_ssl_ca_certificate" {
+  description = "PEM CA certificate of the source MySQL server certificate (SERVER_ONLY, SERVER_CLIENT). For example TF_VAR_source_ssl_ca_certificate=\"$(cat ca.pem)\"."
+  type        = string
+  default     = null
+}
+
+variable "source_ssl_client_certificate" {
+  description = "PEM client certificate for the migration user (SERVER_CLIENT)."
+  type        = string
+  default     = null
+}
+
+variable "source_ssl_client_key" {
+  description = "PEM private key of the client certificate (SERVER_CLIENT). Stored in Terraform state; protect the backend."
+  type        = string
+  default     = null
+  sensitive   = true
+}
+
+# Cloud SQL security options
+variable "cloudsql_ssl_mode" {
+  description = "Cloud SQL ssl_mode for client connections: ENCRYPTED_ONLY (default), ALLOW_UNENCRYPTED_AND_ENCRYPTED or TRUSTED_CLIENT_CERTIFICATE_REQUIRED."
+  type        = string
+  default     = "ENCRYPTED_ONLY"
+
+  validation {
+    condition     = contains(["ALLOW_UNENCRYPTED_AND_ENCRYPTED", "ENCRYPTED_ONLY", "TRUSTED_CLIENT_CERTIFICATE_REQUIRED"], var.cloudsql_ssl_mode)
+    error_message = "cloudsql_ssl_mode must be ALLOW_UNENCRYPTED_AND_ENCRYPTED, ENCRYPTED_ONLY or TRUSTED_CLIENT_CERTIFICATE_REQUIRED."
+  }
+}
+
+variable "cloudsql_kms_key_name" {
+  description = "Optional Cloud KMS key for CMEK on the Cloud SQL instance (projects/P/locations/REGION/keyRings/R/cryptoKeys/K, same region). Set at creation only. Grant the Cloud SQL service agent roles/cloudkms.cryptoKeyEncrypterDecrypter first."
+  type        = string
+  default     = null
+}
+
+variable "cloudsql_password_validation_policy" {
+  description = "Optional Cloud SQL password validation policy for database users (null = off). Enable it after promotion (post-promotion apply): when it is set at creation, the API rejects the instance because the root password is applied afterwards (write-only google_sql_user). Example: { min_length = 14, complexity = \"COMPLEXITY_DEFAULT\", reuse_interval = 5, disallow_username_substring = true }."
+  type = object({
+    min_length                  = optional(number, 12)
+    complexity                  = optional(string, "COMPLEXITY_DEFAULT")
+    reuse_interval              = optional(number, 5)
+    disallow_username_substring = optional(bool, true)
+    password_change_interval    = optional(string)
+  })
+  default = null
+}
+
+# Lifecycle and identity
+variable "migration_enabled" {
+  description = "Set to false after cutover (promotion) to retire the migration objects: the DMS job, connection profiles, demote step, Network Attachment (cleared from the instance first, which RESTARTS it) and the source firewall rule. Cloud SQL, the PSC endpoint and DNS are kept. EXISTING_CLOUDSQL only."
+  type        = bool
+  default     = true
+
+  validation {
+    condition     = var.migration_enabled || var.destination_mode == "EXISTING_CLOUDSQL"
+    error_message = "migration_enabled = false is supported only with destination_mode = \"EXISTING_CLOUDSQL\" (in DMS_MANAGED_CLOUDSQL mode the instance belongs to the DMS destination profile)."
+  }
+}
+
+variable "impersonate_service_account" {
+  description = "Optional deployer service account. The google provider impersonates it, and the gcloud local-exec steps get it as CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT, so both use the same identity. The destroy-time detach step keeps the value from its own state."
+  type        = string
+  default     = null
+}
+
+variable "staging_bucket_kms_key_name" {
+  description = "Optional Cloud KMS key for CMEK on the staging bucket (same location as the bucket). Grant the Cloud Storage service agent roles/cloudkms.cryptoKeyEncrypterDecrypter first."
+  type        = string
+  default     = null
+}
+
+variable "staging_bucket_noncurrent_version_retention_days" {
+  description = "Days after which noncurrent (overwritten or deleted) object versions in the staging bucket are deleted."
+  type        = number
+  default     = 7
 }

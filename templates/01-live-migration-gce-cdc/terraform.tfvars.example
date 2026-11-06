@@ -3,15 +3,29 @@
 # ==============================================================================
 # Copy to terraform.tfvars (git-ignored). Prefer TF_VAR_cloudsql_root_password
 # and TF_VAR_source_gce_mysql_password environment variables over writing
-# passwords to disk.
+# passwords to disk, for example from Secret Manager:
+#   export TF_VAR_source_gce_mysql_password="$(gcloud secrets versions access latest --secret=dms-source-password)"
+# Keep state in a protected remote backend: see backend.tf.example.
 
 project_id            = "my-gcp-project-01"
 region                = "europe-west2"
 connectivity_type     = "PSC"
 network               = "projects/my-gcp-project-01/global/networks/my-vpc"
-subnet                = "projects/my-gcp-project-01/regions/europe-west2/subnetworks/db-subnet" # Network Attachment subnet
-dms_tenant_project_id = ""
+subnet                = "projects/my-gcp-project-01/regions/europe-west2/subnetworks/db-subnet"
+# Recommended: a dedicated small subnet (for example a /28) for the Network Attachment
+network_attachment_subnet = "projects/my-gcp-project-01/regions/europe-west2/subnetworks/dms-na-subnet"
 # network_attachment_name = "dms-mysql-psc-na" # use a unique name per stack in the same project and region
+
+# Network Attachment authorization: ACCEPT_MANUAL (default) accepts only the
+# Cloud SQL tenant project, derived from the instance in the same apply.
+psc_connection_preference = "ACCEPT_MANUAL"
+# psc_producer_accept_list = []            # override only if you must
+# allowed_psc_consumer_projects = []       # extra application projects for PSC endpoints
+
+# Firewall: allow tcp:3306 from the Network Attachment subnet to the source VM
+create_source_firewall_rule = true
+source_target_tags          = ["mysql-source"]
+# source_target_service_accounts = ["mysql-source-vm@my-gcp-project-01.iam.gserviceaccount.com"] # instead of tags
 
 # PSC consumer endpoint + private DNS for applications (created by default)
 create_psc_endpoint = true
@@ -27,6 +41,9 @@ cloudsql_availability_type   = "REGIONAL"
 cloudsql_disk_size_gb        = 500
 cloudsql_root_password       = "REPLACE_WITH_SECURE_ROOT_PASSWORD"
 cloudsql_deletion_protection = true
+cloudsql_ssl_mode            = "ENCRYPTED_ONLY"
+# cloudsql_kms_key_name = "projects/my-gcp-project-01/locations/europe-west2/keyRings/dms/cryptoKeys/cloudsql" # CMEK, set at creation only
+# cloudsql_password_validation_policy = { min_length = 14 } # enable after promotion, not at creation
 # cloudsql_lower_case_table_names = 1 # IMMUTABLE: set only if the source uses 1 (SELECT @@lower_case_table_names)
 
 # Source MySQL 8.0 VM
@@ -35,6 +52,18 @@ source_gce_mysql_port     = 3306
 source_gce_mysql_username = "dms_migration"
 source_gce_mysql_password = "REPLACE_ME_MAX_32_CHARS"
 
+# TLS from DMS to the source (REQUIRED default; SERVER_ONLY / SERVER_CLIENT verify certificates)
+source_ssl_type = "REQUIRED"
+# source_ssl_ca_certificate = "-----BEGIN CERTIFICATE-----..." # or TF_VAR_source_ssl_ca_certificate="$(cat ca.pem)"
+
 # DMS live migration + CDC job
 migration_job_id    = "gce-live-mysql80-cdc"
 dump_parallel_level = "OPTIMAL"
+
+# After promotion: set to false to retire the DMS job, profiles, Network
+# Attachment (restarts the instance) and firewall rule; Cloud SQL, the PSC
+# endpoint and DNS stay (runbook section 10.2).
+# migration_enabled = true
+
+# Optional: deploy as a service account (also used by the gcloud local-exec steps)
+# impersonate_service_account = "terraform-deployer@my-gcp-project-01.iam.gserviceaccount.com"

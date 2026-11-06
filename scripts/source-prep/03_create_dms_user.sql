@@ -41,6 +41,17 @@ EXECUTE create_dms_user;
 DEALLOCATE PREPARE create_dms_user;
 SET @stmt = NULL;
 
+-- Optional: require TLS for this account. DMS connects with TLS when the
+-- Terraform variable source_ssl_type is REQUIRED (default), SERVER_ONLY or
+-- SERVER_CLIENT. Alternatively enforce TLS for every account with
+-- SET PERSIST require_secure_transport = ON; preflight_check.sh reports both.
+-- ALTER USER 'dms_migration'@'%' REQUIRE SSL;
+--
+-- Host: keep '%'. The DMS "Configure your source database" doc creates the
+-- migration user with host '%', so these scripts follow it. Restrict where
+-- connections can come from with the VPC firewall instead: the templates allow
+-- tcp:3306 only from the Network Attachment subnet (create_source_firewall_rule).
+
 -- Scenario 1 (DMS-managed dump):
 --   Required by DMS: REPLICATION SLAVE, REPLICATION CLIENT, EXECUTE, SELECT,
 --                    SHOW VIEW, TRIGGER, RELOAD.

@@ -25,13 +25,30 @@ resource "google_database_migration_service_connection_profile" "source" {
     username = var.source_username
     password = var.source_password
 
+    # TLS from DMS (the Cloud SQL replica) to the source:
+    #   REQUIRED      - encrypted, server certificate not verified (default)
+    #   SERVER_ONLY   - encrypted, server certificate verified against the CA
+    #   SERVER_CLIENT - SERVER_ONLY plus a client certificate and key
+    #   NONE          - no TLS (not recommended)
     dynamic "ssl" {
-      for_each = var.source_ssl_ca_certificate != null ? [1] : []
+      for_each = var.source_ssl_type == "NONE" ? [] : [1]
       content {
-        ca_certificate     = var.source_ssl_ca_certificate
-        client_certificate = var.source_ssl_client_certificate
-        client_key         = var.source_ssl_client_key
+        type               = var.source_ssl_type
+        ca_certificate     = contains(["SERVER_ONLY", "SERVER_CLIENT"], var.source_ssl_type) ? var.source_ssl_ca_certificate : null
+        client_certificate = var.source_ssl_type == "SERVER_CLIENT" ? var.source_ssl_client_certificate : null
+        client_key         = var.source_ssl_type == "SERVER_CLIENT" ? var.source_ssl_client_key : null
       }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = !contains(["SERVER_ONLY", "SERVER_CLIENT"], var.source_ssl_type) || var.source_ssl_ca_certificate != null
+      error_message = "source_ssl_type SERVER_ONLY and SERVER_CLIENT need source_ssl_ca_certificate (PEM)."
+    }
+    precondition {
+      condition     = var.source_ssl_type != "SERVER_CLIENT" || (var.source_ssl_client_certificate != null && var.source_ssl_client_key != null)
+      error_message = "source_ssl_type SERVER_CLIENT needs source_ssl_client_certificate and source_ssl_client_key (PEM)."
     }
   }
 }

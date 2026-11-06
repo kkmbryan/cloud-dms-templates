@@ -69,6 +69,11 @@ resource "google_database_migration_service_migration_job" "migration" {
     }
   }
 
+  # Deleting the job (terraform destroy, or migration_enabled = false): DMS
+  # accepts the delete even while the job is RUNNING (tested), and the provider
+  # never sets --force, so the destination Cloud SQL instance is kept. A job
+  # deleted before promotion leaves the instance as a read replica: promote it
+  # with `gcloud sql instances promote-replica` or delete it.
   lifecycle {
     precondition {
       condition     = !(var.dump_type == "PHYSICAL" && !local.use_gcs_backup_dump)
@@ -90,7 +95,10 @@ resource "google_database_migration_service_migration_job" "migration" {
 resource "terraform_data" "demote_destination" {
   count = local.use_existing_cloudsql && var.demote_destination ? 1 : 0
 
+  # Re-run the demote only when the job itself is replaced.
   triggers_replace = [
+    var.project_id,
+    var.region,
     google_database_migration_service_migration_job.migration.name,
   ]
 
@@ -99,12 +107,16 @@ resource "terraform_data" "demote_destination" {
     region           = var.region
     migration_job_id = google_database_migration_service_migration_job.migration.migration_job_id
     timeout_seconds  = var.demote_timeout_seconds
+    impersonate_sa   = var.impersonate_service_account == null ? "" : var.impersonate_service_account
   }
 
   provisioner "local-exec" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -euo pipefail
+      if [ -n "${self.input.impersonate_sa}" ]; then
+        export CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT="${self.input.impersonate_sa}"
+      fi
       PROJECT="${self.input.project_id}"
       REGION="${self.input.region}"
       JOB="${self.input.migration_job_id}"

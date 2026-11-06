@@ -17,12 +17,16 @@
 | **网络连接** | 默认使用 **Private Service Connect (`PSC`)**（可选 `PSA`） | Cloud SQL 实例仅使用 PSC（无公共 IP）。复制方面，会将 Compute Engine Network Attachment 挂接到实例（`psc_config.network_attachment_uri`，PSC 接口），使 DMS 能够访问您 VPC 中的源端。应用方面，模板会创建 PSC 使用方端点（内部 IP + 转发规则），并为实例 DNS 名称创建私有 Cloud DNS 记录。 |
 | **目标版本类型与高可用** | Cloud SQL **Enterprise Plus**（`REGIONAL` 高可用 + Data Cache） | 区域级高可用、Data Cache（`data_cache_enabled = true`）、基于二进制日志的时间点恢复以及自动备份。 |
 | **切换策略** | 持续复制（`type = "CONTINUOUS"`） | 两个模板在初始数据填充完成后均持续复制基于 GTID 的二进制日志变更，便于您验证目标实例，并在较短的维护窗口内完成提升。 |
+| **网络安全** | `ACCEPT_MANUAL` Network Attachment + 源端防火墙规则 | Network Attachment 仅接受 Cloud SQL 租户项目，该项目在同一次 apply 中从实例推导得出（`ACCEPT_AUTOMATIC` 为可选项）。一条防火墙规则（已开启日志）仅允许 Network Attachment 子网访问源端 MySQL 端口。请参阅 [docs/security_hardening.zh-CN.md](docs/security_hardening.zh-CN.md)。 |
+| **传输加密** | `source_ssl_type = "REQUIRED"`、`cloudsql_ssl_mode = "ENCRYPTED_ONLY"` | DMS 通过 TLS 从源端复制数据，Cloud SQL 仅接受加密的客户端连接。CMEK（`cloudsql_kms_key_name`、`staging_bucket_kms_key_name`）为可选项。 |
+| **生命周期** | `migration_enabled = true` → 切换后设为 `false` | 设为 `false` 后会下线 DMS 作业、连接配置文件、Network Attachment 和防火墙规则，并保留 Cloud SQL、PSC 端点和 DNS（运维手册第 10.2 节）。 |
 
 ```mermaid
 flowchart LR
   subgraph APP_VPC["客户 VPC（europe-west2）"]
     GCE["MySQL 8.0 源虚拟机<br/>(GTID=ON, ROW binlog)"]
-    NA["PSC Network Attachment<br/>(dms-mysql-psc-na)"]
+    NA["PSC Network Attachment<br/>（ACCEPT_MANUAL，专用子网）"]
+    FW["防火墙规则<br/>（NA 子网至 tcp:3306）"]
     EP["PSC 端点 + 私有 DNS<br/>（应用）"]
     APP["应用"]
   end
@@ -40,7 +44,8 @@ flowchart LR
   end
 
   CSQL -->|"PSC 接口：复制至端口 3306"| NA
-  NA --> GCE
+  NA --> FW
+  FW -->|"TLS（source_ssl_type）"| GCE
   GCE -->|"场景 2：上传初始数据"| GCS
   GCS -->|"场景 2：从 dump_path 填充"| CSQL
   JOB -->|"编排初始数据填充、降级与 CDC"| CSQL
@@ -85,11 +90,14 @@ flowchart LR
 
 | 要求 | 详细信息 | 检查方式 |
 | :--- | :--- | :--- |
-| **工具** | Terraform `>= 1.11`（只写 root 密码）、Google Cloud CLI（`gcloud`）、Bash。`local-exec` 步骤（挂接 Network Attachment、降级）会调用 `gcloud`。 | `terraform version`、`gcloud version` |
-| **凭据** | 供 Terraform 使用的应用默认凭据（ADC），以及供 `local-exec` 步骤使用的有效 `gcloud` 账号，两者都需要具备下方的部署者角色。 | `gcloud auth application-default login`、`gcloud auth list` |
+| **工具** | Terraform `>= 1.11`（只写 root 密码）、Google Cloud CLI（`gcloud`）、Bash。`local-exec` 步骤（挂接与分离 Network Attachment、降级）会调用 `gcloud`。 | `terraform version`、`gcloud version` |
+| **凭据** | 供 Terraform 使用的应用默认凭据（ADC），以及供 `local-exec` 步骤使用的有效 `gcloud` 账号，两者都需要具备下方的部署者角色。如需让两者使用同一身份，请设置 `impersonate_service_account`（提供程序会模拟该服务账号，`local-exec` 步骤会获得 `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT`）；销毁时的分离步骤会沿用同一设置。 | `gcloud auth application-default login`、`gcloud auth list` |
 | **API** | `datamigration`、`sqladmin`、`compute`、`servicenetworking`、`storage`、`dns`。 | 请参阅下方命令 |
 | **DMS 服务代理** | 必须在首次 apply 之前存在（场景 2 会为其授予存储桶访问权限）。 | 请参阅下方命令 |
-| **部署者角色** | 项目级的 `roles/datamigration.admin`、`roles/cloudsql.admin`、`roles/compute.networkAdmin`、`roles/dns.admin`、`roles/storage.admin`（场景 2）以及 `roles/serviceusage.serviceUsageConsumer`。 | `gcloud projects get-iam-policy PROJECT_ID` |
+| **部署者角色** | 项目级的 `roles/datamigration.admin`、`roles/cloudsql.admin`、`roles/compute.networkAdmin`、`roles/compute.securityAdmin`（源端防火墙规则）、`roles/dns.admin`、`roles/storage.admin`（场景 2）以及 `roles/serviceusage.serviceUsageConsumer`。最小权限详情：[docs/security_hardening.zh-CN.md](docs/security_hardening.zh-CN.md)。 | `gcloud projects get-iam-policy PROJECT_ID` |
+| **网络** | 供 Network Attachment 使用的专用小子网（`network_attachment_subnet`，例如 `/28`），以及供防火墙规则使用的源虚拟机网络标记或服务账号（`source_target_tags` 或 `source_target_service_accounts`）。 | `gcloud compute networks subnets list` |
+| **组织政策** | 检查组织政策预检表中的约束条件（`sql.restrictPublicIp`、`gcp.restrictNonCmekServices`、`gcp.resourceLocations`、PSC 限制）。 | [docs/security_hardening.zh-CN.md](docs/security_hardening.zh-CN.md) |
+| **状态与密钥凭据** | 启用版本控制和 CMEK 的远程 GCS 后端（各模板中的 `backend.tf.example`）；密码通过 `TF_VAR_*` 从 Secret Manager 读取。 | `gcloud secrets versions access latest --secret=...` |
 | **源数据库** | [运维手册第 2 节](docs/gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md)中的 GTID 与 binlog 设置以及迁移账号，可使用 [`scripts/source-prep/`](scripts/source-prep/README.zh-CN.md) 完成准备。 | `make preflight`（在源虚拟机上） |
 
 ```bash
@@ -111,12 +119,18 @@ gcloud beta services identity create --service=datamigration.googleapis.com --pr
 
 ```text
 cloud-dms-templates/
-├── .github/workflows/
-│   └── terraform-ci.yml                  # Automated fmt & validate CI pipeline
+├── .github/
+│   ├── CODEOWNERS
+│   ├── ISSUE_TEMPLATE/                   # Bug report and feature request templates
+│   ├── pull_request_template.md
+│   └── workflows/
+│       └── terraform-ci.yml              # Automated fmt & validate CI pipeline
 ├── .gitignore                            # Excludes state, .terraform, secrets
 ├── .pre-commit-config.yaml               # Pre-commit hooks (fmt, validate, tflint, checkov)
 ├── .tflint.hcl                           # TFLint Google ruleset configuration
+├── CONTRIBUTING.md                       # Development gates, EN/zh-CN sync, customer-safe content
 ├── LICENSE                               # Apache License 2.0
+├── SECURITY.md                           # Vulnerability reporting (GitHub private advisory)
 ├── Makefile                              # Day-1/Day-2 automation targets
 ├── README.md                             # Root architecture & usage documentation
 ├── README.zh-CN.md                       # Simplified Chinese (zh-CN) root documentation
@@ -124,7 +138,9 @@ cloud-dms-templates/
 ├── TESTING.zh-CN.md
 ├── docs/
 │   ├── gce_mysql80_to_cloudsql_dms_migration_runbook.md
-│   └── gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md
+│   ├── gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md
+│   ├── security_hardening.md             # Network, TLS, secrets, CMEK, org policy, IAM, audit logs
+│   └── security_hardening.zh-CN.md
 ├── scripts/
 │   └── source-prep/                      # Source MySQL 8.0 preparation (make preflight)
 │       ├── 01_mysqld_dms_source.cnf      # my.cnf drop-in: server_id, ROW binlog, GTID, retention
@@ -134,7 +150,7 @@ cloud-dms-templates/
 │       ├── README.md
 │       └── README.zh-CN.md
 ├── modules/
-│   ├── networking-psc/                   # PSC Network Attachment (or PSA peering)
+│   ├── networking-psc/                   # PSC Network Attachment (ACCEPT_MANUAL) + source firewall rule (or PSA peering)
 │   ├── gcs-migration-staging/            # Staging bucket + reader/writer IAM
 │   ├── cloudsql-mysql-destination/       # Cloud SQL MySQL 8.0 / 8.4 target + PSC interface
 │   ├── cloudsql-psc-endpoint/            # PSC consumer endpoint + private DNS for applications
@@ -143,10 +159,12 @@ cloud-dms-templates/
 └── templates/
     ├── 01-live-migration-gce-cdc/        # Root Template 1: DMS-managed dump + CDC
     │   ├── .terraform.lock.hcl
+    │   ├── backend.tf.example            # GCS remote state with versioning + CMEK
     │   ├── README.md
     │   └── README.zh-CN.md
     └── 02-backup-migration-gcs-cdc/      # Root Template 2: seed from Cloud Storage + CDC
         ├── .terraform.lock.hcl
+        ├── backend.tf.example
         ├── README.md
         ├── README.zh-CN.md
         └── scripts/
@@ -169,9 +187,11 @@ make validate
 ```bash
 cd templates/01-live-migration-gce-cdc
 cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars: project_id, network, subnets, source IP
-export TF_VAR_cloudsql_root_password='REPLACE_ME'
-export TF_VAR_source_gce_mysql_password='REPLACE_ME_MAX_32_CHARS'
+# Edit terraform.tfvars: project_id, network, subnets (incl. network_attachment_subnet),
+# source IP and source_target_tags (firewall rule)
+cp backend.tf.example backend.tf   # optional but recommended: remote state (edit bucket/key)
+export TF_VAR_cloudsql_root_password="$(gcloud secrets versions access latest --secret=cloudsql-root-password)"
+export TF_VAR_source_gce_mysql_password="$(gcloud secrets versions access latest --secret=dms-source-password)"
 terraform init
 terraform plan -out=tfplan
 terraform apply tfplan
@@ -222,12 +242,14 @@ make lag PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql8
 make promote-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
 ```
 
-提升之前，请完成运维手册第 8 节中的 Go / No-Go 检查清单和回退决策。提升之后，应用连接到 `terraform output -raw psc_endpoint_dns_name`（即实例 DNS 名称，由私有区域解析为 PSC 端点 IP）；然后运行 `terraform plan`/`apply`（运维手册第 9.1 节）。如需清理与下线，请参阅运维手册第 10 节。
+提升之前，请完成运维手册第 8 节中的 Go / No-Go 检查清单和回退决策。提升之后，应用连接到 `terraform output -raw psc_endpoint_dns_name`（即实例 DNS 名称，由私有区域解析为 PSC 端点 IP），并使用 TLS；然后运行 `terraform plan`/`apply`（运维手册第 9.1 节）。如需下线迁移对象并保留 Cloud SQL，请设置 `migration_enabled = false` 并执行 apply（运维手册第 10.2 节；分离 Network Attachment 会重启实例）。
 
 ---
 
 ## 6. 测试、支持与许可
 
 - [TESTING.zh-CN.md](TESTING.zh-CN.md) 列出了已测试的版本和场景以及已知限制。
+- [docs/security_hardening.zh-CN.md](docs/security_hardening.zh-CN.md) 介绍了网络控制、TLS、密钥凭据与状态、CMEK、组织政策、部署者 IAM 以及审核日志。
+- 请按照 [SECURITY.md](SECURITY.md) 中的说明报告安全漏洞。贡献规则：[CONTRIBUTING.md](CONTRIBUTING.md)。
 - 本项目不是 Google 官方支持的产品，不提供支持或 SLA。
 - 依据 [Apache License 2.0](LICENSE) 授权。
