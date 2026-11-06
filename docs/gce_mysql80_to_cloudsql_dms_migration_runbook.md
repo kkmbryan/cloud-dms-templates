@@ -535,5 +535,5 @@ flowchart LR
    (umask 077; terraform state pull > pre-decommission.tfstate)   # contains secrets: mode 0600
    terraform state rm module.cloudsql_destination module.cloudsql_psc_endpoint
    # After the import into the long-lived stack succeeds:
-   shred -u pre-decommission.tfstate
+   shred -u pre-decommission.tfstate 2>/dev/null || rm -P pre-decommission.tfstate   # Linux: shred; macOS: rm -P
    ```
