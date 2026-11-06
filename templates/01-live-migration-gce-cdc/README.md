@@ -1,5 +1,7 @@
 # Scenario 1: Live Migration from Self-Managed GCE MySQL 8.0 + Continuous CDC
 
+**English** | [简体中文](README.zh-CN.md)
+
 ## Overview
 
 This root Terraform template deploys an end-to-end **Live Initial Dump + Continuous Change Data Capture (CDC)** pipeline using **Google Cloud Database Migration Service (DMS)** to migrate self-managed **MySQL 8.0 on Compute Engine (GCE)** to **Cloud SQL for MySQL (`MYSQL_8_4` LTS default or `MYSQL_8_0`)** with near-zero downtime.
