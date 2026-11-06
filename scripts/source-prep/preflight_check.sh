@@ -334,6 +334,26 @@ else
 fi
 
 # ------------------------------------------------------------------------------
+# TLS: DMS connects with source_ssl_type = REQUIRED by default (Terraform), so
+# the server must offer TLS. have_ssl is read from performance_schema because the
+# system variable is deprecated.
+# ------------------------------------------------------------------------------
+TLS="$(q "/* chk:tls */ SELECT CONCAT_WS(CHAR(31),
+  @@GLOBAL.require_secure_transport,
+  IFNULL((SELECT VARIABLE_VALUE FROM performance_schema.global_variables WHERE VARIABLE_NAME = 'have_ssl'), ''),
+  IFNULL((SELECT ssl_type FROM mysql.user WHERE User = '${DMS_USER}' AND Host = '${DMS_HOST}'), ''))")"
+IFS=$'\x1f' read -r V_REQUIRE_SECURE V_HAVE_SSL V_USER_SSL_TYPE <<<"${TLS}"
+case "${V_REQUIRE_SECURE}" in 1 | ON) V_REQUIRE_SECURE="ON" ;; *) V_REQUIRE_SECURE="OFF" ;; esac
+TLS_INFO="require_secure_transport=${V_REQUIRE_SECURE}, have_ssl=${V_HAVE_SSL:-unknown}, ${DMS_USER} ssl_type=${V_USER_SSL_TYPE:-none}"
+if [[ "${V_HAVE_SSL}" != "YES" ]]; then
+  add WARN "tls" "${TLS_INFO}: TLS isn't available, so source_ssl_type=REQUIRED fails verify; configure ssl_cert/ssl_key (or set source_ssl_type=NONE, not recommended)"
+elif [[ "${V_REQUIRE_SECURE}" == "ON" || -n "${V_USER_SSL_TYPE}" ]]; then
+  add PASS "tls" "${TLS_INFO}"
+else
+  add WARN "tls" "${TLS_INFO}: TLS is available but not enforced; use SET PERSIST require_secure_transport = ON or ALTER USER '${DMS_USER}'@'%' REQUIRE SSL"
+fi
+
+# ------------------------------------------------------------------------------
 # Schema checks (user schemas only).
 # ------------------------------------------------------------------------------
 NON_INNODB="$(q "/* chk:non_innodb */ SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE

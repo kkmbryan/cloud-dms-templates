@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/kkmbryan/cloud-dms-templates/security/policy
+    about: Don't open a public issue. Report vulnerabilities privately through the Security tab (Report a vulnerability), as described in the security policy.

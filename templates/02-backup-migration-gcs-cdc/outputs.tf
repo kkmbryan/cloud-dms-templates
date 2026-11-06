@@ -28,14 +28,24 @@ output "dms_service_agent" {
   value       = local.dms_service_agent
 }
 
+output "network_attachment_producer_accept_list" {
+  description = "Producer projects accepted by the Network Attachment (ACCEPT_MANUAL): the Cloud SQL tenant project unless overridden."
+  value       = module.networking.network_attachment_producer_accept_list
+}
+
+output "source_firewall_rule_name" {
+  description = "Firewall rule that allows the Network Attachment subnet to reach the source MySQL port (null when not created)."
+  value       = module.networking.source_firewall_rule_name
+}
+
 output "cloudsql_instance_name" {
   description = "Name of the destination Cloud SQL for MySQL instance."
-  value       = coalesce(module.cloudsql_destination.instance_name, module.dms_connection_profiles.dms_cloud_sql_id, var.cloudsql_instance_name)
+  value       = coalesce(module.cloudsql_destination.instance_name, try(module.dms_connection_profiles[0].dms_cloud_sql_id, null), var.cloudsql_instance_name)
 }
 
 output "cloudsql_private_ip" {
   description = "Private (PSA) IPv4 address of the destination Cloud SQL instance. Null for the default PSC-only instance; use psc_endpoint_ip_address instead."
-  value       = try(coalesce(module.cloudsql_destination.private_ip_address, module.dms_connection_profiles.dms_cloud_sql_private_ip), null)
+  value       = try(coalesce(module.cloudsql_destination.private_ip_address, try(module.dms_connection_profiles[0].dms_cloud_sql_private_ip, null)), null)
 }
 
 output "cloudsql_connection_name" {
@@ -75,12 +85,12 @@ output "cloudsql_service_account_email" {
 
 output "source_connection_profile_name" {
   description = "Full resource name of the source MySQL 8.0 DMS connection profile."
-  value       = module.dms_connection_profiles.source_connection_profile_name
+  value       = try(module.dms_connection_profiles[0].source_connection_profile_name, null)
 }
 
 output "destination_connection_profile_name" {
   description = "Full resource name of the destination Cloud SQL DMS connection profile."
-  value       = module.dms_connection_profiles.destination_connection_profile_name
+  value       = try(module.dms_connection_profiles[0].destination_connection_profile_name, null)
 }
 
 output "migration_job_name" {

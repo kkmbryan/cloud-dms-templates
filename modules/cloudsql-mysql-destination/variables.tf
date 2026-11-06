@@ -70,7 +70,7 @@ variable "connectivity_type" {
 }
 
 variable "allowed_psc_projects" {
-  description = "List of consumer project IDs allowed to connect to this Cloud SQL instance via Private Service Connect (PSC)."
+  description = "Consumer project IDs allowed to create PSC endpoints to this instance (the project that hosts the PSC endpoint, plus any application projects). Defaults to [project_id]. Applied at creation; psc_config is in ignore_changes, so change it later with `gcloud sql instances patch --allowed-psc-projects`."
   type        = list(string)
   default     = []
 }
@@ -196,4 +196,44 @@ variable "labels" {
   description = "User labels to apply to the Cloud SQL instance."
   type        = map(string)
   default     = {}
+}
+
+variable "ssl_mode" {
+  description = "Cloud SQL ssl_mode for client connections: ALLOW_UNENCRYPTED_AND_ENCRYPTED, ENCRYPTED_ONLY (default) or TRUSTED_CLIENT_CERTIFICATE_REQUIRED."
+  type        = string
+  default     = "ENCRYPTED_ONLY"
+
+  validation {
+    condition     = contains(["ALLOW_UNENCRYPTED_AND_ENCRYPTED", "ENCRYPTED_ONLY", "TRUSTED_CLIENT_CERTIFICATE_REQUIRED"], var.ssl_mode)
+    error_message = "ssl_mode must be ALLOW_UNENCRYPTED_AND_ENCRYPTED, ENCRYPTED_ONLY or TRUSTED_CLIENT_CERTIFICATE_REQUIRED."
+  }
+}
+
+variable "kms_key_name" {
+  description = "Optional Cloud KMS key (projects/P/locations/REGION/keyRings/R/cryptoKeys/K) for CMEK on the instance. Set at creation only; the key must be in the instance region."
+  type        = string
+  default     = null
+}
+
+variable "password_validation_policy" {
+  description = "Optional password validation policy for database users (null disables it). Enable it on an existing instance (for example after promotion): at creation the API checks the root password, which google_sql_user sets only afterwards, and rejects the instance. complexity: COMPLEXITY_DEFAULT or COMPLEXITY_UNSPECIFIED. (password_change_interval is not offered: Cloud SQL supports it only for PostgreSQL.)"
+  type = object({
+    min_length                  = optional(number, 12)
+    complexity                  = optional(string, "COMPLEXITY_DEFAULT")
+    reuse_interval              = optional(number, 5)
+    disallow_username_substring = optional(bool, true)
+  })
+  default = null
+}
+
+variable "operation_timeout_seconds" {
+  description = "Maximum time in seconds to wait for each Cloud SQL patch operation run by the local-exec steps (attach and detach the Network Attachment)."
+  type        = number
+  default     = 1800
+}
+
+variable "impersonate_service_account" {
+  description = "Optional service account that the gcloud local-exec steps impersonate (exported as CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT). Set it to the provider's impersonate_service_account so that Terraform and gcloud use the same identity."
+  type        = string
+  default     = null
 }

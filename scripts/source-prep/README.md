@@ -59,6 +59,8 @@ SOURCE scripts/source-prep/03_create_dms_user.sql
 
 The file grants the Scenario 1 privileges: the set required by DMS (`REPLICATION SLAVE`, `REPLICATION CLIENT`, `EXECUTE`, `SELECT`, `SHOW VIEW`, `TRIGGER`, `RELOAD`) plus the recommended extra `EVENT` and `LOCK TABLES` (events / parallel dump). For Scenario 2, comment out the Scenario 1 `GRANT` and uncomment the Scenario 2 `GRANT` first. The `xtrabackup` user is created only when `@xtrabackup_password` is set. Don't grant `BACKUP_ADMIN` to `dms_migration`, and you don't need `FLUSH PRIVILEGES`.
 
+To require TLS for the migration account, uncomment `ALTER USER 'dms_migration'@'%' REQUIRE SSL;` in the file, or enforce TLS for all accounts with `SET PERSIST require_secure_transport = ON;`. The host stays `'%'` because the DMS documentation creates the user that way; the template's firewall rule limits port 3306 to the Network Attachment subnet instead.
+
 ---
 
 ## 4. Run the Pre-Flight Check
@@ -120,6 +122,7 @@ Exit codes: `0` no FAIL (WARNs allowed), `1` at least one FAIL, `2` usage, optio
 | `enforce_gtid_consistency` | Not `ON` | — |
 | `binlog_retention` | Retention < seed time (`binlog_expire_logs_seconds`, or `expire_logs_days` × 86400 when the former is `0`) | < seed time + 24 h buffer, or < 7 days |
 | `dms_user_grants` | User `'<dms-user>'@'%'` missing, a required scenario privilege missing, or `BACKUP_ADMIN` present | `ALL PRIVILEGES` granted, or Scenario 1 recommended extra `EVENT` / `LOCK TABLES` missing |
+| `tls` | — | TLS isn't available (`have_ssl` not `YES`; Terraform's default `source_ssl_type = "REQUIRED"` then fails `verify`), or TLS is available but not enforced (`require_secure_transport = OFF` and the DMS user has no `REQUIRE SSL`) |
 | `non_innodb_tables` | — | User tables that aren't InnoDB |
 | `primary_keys` | — | User tables without a primary key or a unique `NOT NULL` key |
 | `definers` | — | Events, routines, triggers or views whose DEFINER doesn't exist or is `root@localhost` |
