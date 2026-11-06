@@ -1,7 +1,7 @@
 output "instance_name" {
   description = "The name of the provisioned Cloud SQL for MySQL destination instance."
   value       = var.enabled ? google_sql_database_instance.destination[0].name : null
-  depends_on  = [terraform_data.psc_outbound_network_attachment]
+  depends_on  = [terraform_data.psc_outbound_network_attachment, google_sql_user.root]
 }
 
 output "instance_connection_name" {

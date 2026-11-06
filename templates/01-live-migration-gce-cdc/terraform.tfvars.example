@@ -11,6 +11,7 @@ connectivity_type     = "PSC"
 network               = "projects/my-gcp-project-01/global/networks/my-vpc"
 subnet                = "projects/my-gcp-project-01/regions/europe-west2/subnetworks/db-subnet" # Network Attachment subnet
 dms_tenant_project_id = ""
+# network_attachment_name = "dms-mysql-psc-na" # use a unique name per stack in the same project and region
 
 # PSC consumer endpoint + private DNS for applications (created by default)
 create_psc_endpoint = true
@@ -26,6 +27,7 @@ cloudsql_availability_type   = "REGIONAL"
 cloudsql_disk_size_gb        = 500
 cloudsql_root_password       = "REPLACE_WITH_SECURE_ROOT_PASSWORD"
 cloudsql_deletion_protection = true
+# cloudsql_lower_case_table_names = 1 # IMMUTABLE: set only if the source uses 1 (SELECT @@lower_case_table_names)
 
 # Source MySQL 8.0 VM
 source_gce_mysql_host     = "10.10.0.10"

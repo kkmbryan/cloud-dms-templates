@@ -31,6 +31,12 @@ variable "subnet" {
   default     = ""
 }
 
+variable "network_attachment_name" {
+  description = "Name of the PSC Network Attachment. Use a different name per stack when several migrations share a project and region."
+  type        = string
+  default     = "dms-mysql-psc-na"
+}
+
 variable "dms_tenant_project_id" {
   description = "Optional Google-managed DMS/Cloud SQL tenant project ID (e.g., 'p123456-abcdef-tp') to add to the PSC Network Attachment producer_accept_lists."
   type        = string
@@ -68,7 +74,7 @@ variable "additional_bucket_reader_members" {
 }
 
 variable "backup_writer_members" {
-  description = "IAM principals (for example the source VM's service account) granted roles/storage.objectCreator on the staging bucket to upload the seed."
+  description = "IAM principals (for example the source VM's service account) granted roles/storage.objectCreator + roles/storage.objectViewer on the staging bucket to upload the seed (gcloud storage cp needs both; neither can delete or overwrite)."
   type        = list(string)
   default     = []
 }
@@ -154,7 +160,7 @@ variable "cloudsql_disk_size_gb" {
 }
 
 variable "cloudsql_root_password" {
-  description = "Initial root password for the destination Cloud SQL instance. Sent through the write-only root_password_wo argument (EXISTING_CLOUDSQL), so it is not stored in Terraform state."
+  description = "Initial root password for the destination Cloud SQL instance. Applied to root@'%' through the write-only password_wo argument of google_sql_user (EXISTING_CLOUDSQL), so it is not stored in Terraform state."
   type        = string
   sensitive   = true
 }
@@ -163,6 +169,12 @@ variable "cloudsql_root_password_version" {
   description = "Version of the write-only Cloud SQL root password. Increment it to push a new cloudsql_root_password to the instance (the password is never stored in Terraform state)."
   type        = number
   default     = 1
+}
+
+variable "cloudsql_lower_case_table_names" {
+  description = "Optional lower_case_table_names for the destination (0 or 1). IMMUTABLE after the instance is created. Set it to the source value (SELECT @@lower_case_table_names). Null keeps the Cloud SQL default (0)."
+  type        = number
+  default     = null
 }
 
 variable "cloudsql_deletion_protection" {
@@ -237,6 +249,12 @@ variable "migration_job_id" {
   description = "Identifier for the backup-seeded continuous DMS migration job."
   type        = string
   default     = "gcs-bkp-mysql80-cdc"
+}
+
+variable "create_migration_job" {
+  description = "Create the DMS migration job (and demote the destination). DMS rejects the job if the seed doesn't exist at dump_path yet, so use false for the first apply, upload the seed to configured_dump_path, then apply again with true."
+  type        = bool
+  default     = true
 }
 
 variable "dump_type" {

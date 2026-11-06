@@ -56,12 +56,16 @@ resource "google_storage_bucket_iam_member" "readers" {
   member = each.value.member
 }
 
-# Writers only need to create objects (upload the dump). They can't delete or
-# overwrite existing backup objects.
+# Writers upload the seed. `gcloud storage cp` also reads object metadata
+# (storage.objects.get) and the helper script lists the folder, so writers get
+# objectCreator + objectViewer. Neither role can delete or overwrite objects.
 resource "google_storage_bucket_iam_member" "backup_writers" {
-  for_each = toset(var.backup_writer_members)
+  for_each = {
+    for pair in setproduct(var.backup_writer_members, ["roles/storage.objectCreator", "roles/storage.objectViewer"]) :
+    "${pair[0]}/${pair[1]}" => { member = pair[0], role = pair[1] }
+  }
 
   bucket = google_storage_bucket.migration_staging.name
-  role   = "roles/storage.objectCreator"
-  member = each.value
+  role   = each.value.role
+  member = each.value.member
 }

@@ -6,14 +6,15 @@
 module "networking" {
   source = "../../modules/networking-psc"
 
-  project_id            = var.project_id
-  region                = var.region
-  connectivity_type     = var.connectivity_type
-  network               = var.network
-  subnet                = var.subnet
-  dms_tenant_project_id = var.dms_tenant_project_id
-  create_psa_peering    = var.create_psa_peering
-  labels                = var.labels
+  project_id              = var.project_id
+  region                  = var.region
+  connectivity_type       = var.connectivity_type
+  network                 = var.network
+  subnet                  = var.subnet
+  network_attachment_name = var.network_attachment_name
+  dms_tenant_project_id   = var.dms_tenant_project_id
+  create_psa_peering      = var.create_psa_peering
+  labels                  = var.labels
 }
 
 # 2. Cloud SQL for MySQL destination instance (MYSQL_8_4 default or MYSQL_8_0)
@@ -37,6 +38,7 @@ module "cloudsql_destination" {
   disk_size_gb               = var.cloudsql_disk_size_gb
   root_password              = var.cloudsql_root_password
   root_password_wo_version   = var.cloudsql_root_password_version
+  lower_case_table_names     = var.cloudsql_lower_case_table_names
   deletion_protection        = var.cloudsql_deletion_protection
   labels                     = var.labels
 }

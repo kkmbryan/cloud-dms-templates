@@ -85,20 +85,20 @@ output "destination_connection_profile_name" {
 
 output "migration_job_name" {
   description = "Full resource name of the continuous DMS migration job."
-  value       = module.dms_migration_job.migration_job_name
+  value       = try(module.dms_migration_job[0].migration_job_name, null)
 }
 
 output "migration_job_id" {
   description = "Short ID of the continuous DMS migration job."
-  value       = module.dms_migration_job.migration_job_id
+  value       = try(module.dms_migration_job[0].migration_job_id, null)
 }
 
 output "migration_job_state" {
   description = "State of the DMS migration job as of the last Terraform refresh."
-  value       = module.dms_migration_job.migration_job_state
+  value       = try(module.dms_migration_job[0].migration_job_state, null)
 }
 
 output "migration_job_phase" {
   description = "Phase of the DMS migration job as of the last Terraform refresh."
-  value       = module.dms_migration_job.migration_job_phase
+  value       = try(module.dms_migration_job[0].migration_job_phase, null)
 }

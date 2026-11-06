@@ -1,10 +1,27 @@
 locals {
-  default_flags = [
-    {
-      name  = "cloudsql_iam_authentication"
-      value = "on"
-    }
-  ]
+  default_flags = concat(
+    [
+      {
+        name  = "cloudsql_iam_authentication"
+        value = "on"
+      }
+    ],
+    # DMS requires local_infile=ON on the destination for MySQL 8.0 -> 8.4.
+    # https://cloud.google.com/database-migration/docs/mysql/known-limitations
+    var.database_version == "MYSQL_8_4" ? [
+      {
+        name  = "local_infile"
+        value = "on"
+      }
+    ] : [],
+    # lower_case_table_names can only be set when the instance is created.
+    var.lower_case_table_names != null ? [
+      {
+        name  = "lower_case_table_names"
+        value = tostring(var.lower_case_table_names)
+      }
+    ] : [],
+  )
 
   user_flag_names = [for f in var.database_flags : f.name]
 
@@ -25,11 +42,10 @@ resource "google_sql_database_instance" "destination" {
   database_version    = var.database_version
   deletion_protection = var.deletion_protection
 
-  # Write-only argument (Terraform >= 1.11): the root password is sent to the
-  # API but not stored in Terraform state. A saved plan file (terraform plan
-  # -out) still contains root module input variables, so protect plan files.
-  root_password_wo         = var.root_password
-  root_password_wo_version = nonsensitive(var.root_password != null) ? tostring(var.root_password_wo_version) : null
+  # The root password is applied by google_sql_user.root below with a
+  # write-only argument (Terraform >= 1.11), so it is not stored in Terraform
+  # state. A saved plan file (terraform plan -out) still contains root module
+  # input variables, so protect plan files.
 
   settings {
     tier                        = var.tier
@@ -84,6 +100,28 @@ resource "google_sql_database_instance" "destination" {
       settings[0].ip_configuration[0].psc_config
     ]
   }
+}
+
+# ------------------------------------------------------------------------------
+# root@'%' with a write-only password.
+# When root_password is not set, the provider deletes the default root@'%' user
+# after it creates the instance (it does not take root_password_wo into account).
+# This resource recreates root@'%' with password_wo, so the password is still
+# kept out of Terraform state. Create it before DMS demotes the instance.
+# ------------------------------------------------------------------------------
+resource "google_sql_user" "root" {
+  count = var.enabled && nonsensitive(var.root_password != null) ? 1 : 0
+
+  project             = var.project_id
+  instance            = google_sql_database_instance.destination[0].name
+  name                = "root"
+  host                = "%"
+  password_wo         = var.root_password
+  password_wo_version = var.root_password_wo_version
+
+  # DMS and promotion manage users on the instance during the migration; don't
+  # let a later destroy of this user fail the teardown.
+  deletion_policy = "ABANDON"
 }
 
 # ------------------------------------------------------------------------------

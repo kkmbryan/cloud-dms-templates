@@ -136,7 +136,7 @@ variable "deletion_protection" {
 }
 
 variable "root_password" {
-  description = "Initial root password for the Cloud SQL instance. Sent through the write-only root_password_wo argument, so it is not stored in Terraform state."
+  description = "Initial root password for the Cloud SQL instance. Applied to root@'%' through the write-only password_wo argument of google_sql_user, so it is not stored in Terraform state."
   type        = string
   default     = null
   sensitive   = true
@@ -146,6 +146,17 @@ variable "root_password_wo_version" {
   description = "Version of the write-only root password. Increment it to push a new root_password value to the instance."
   type        = number
   default     = 1
+}
+
+variable "lower_case_table_names" {
+  description = "Optional lower_case_table_names flag (0 or 1). IMMUTABLE: Cloud SQL for MySQL 8.0+ accepts it only when the instance is created; the API rejects later changes, so set it before the first apply. Match the source value. Null leaves the Cloud SQL default (0)."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.lower_case_table_names == null || contains([0, 1], coalesce(var.lower_case_table_names, 0))
+    error_message = "lower_case_table_names must be null, 0 or 1."
+  }
 }
 
 variable "database_flags" {

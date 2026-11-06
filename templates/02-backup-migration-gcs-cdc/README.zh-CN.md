@@ -10,7 +10,7 @@
 
 - **由您控制初始数据**：不使用由 DMS 管理的转储，而是按您自己的时间安排生成 **`mysqldump` 文件（`LOGICAL`，默认）** 或 **已准备的 Percona XtraBackup（`PHYSICAL`）**，并上传到区域级 **Cloud Storage (GCS)** 暂存存储桶。
 - **初始数据填充 + 自动恢复 GTID CDC**：DMS 从 `dump_path` 恢复初始数据，读取备份中记录的 GTID 位置，然后从在线源端持续复制 **binlog CDC** 变更，直至切换。
-- **自动配置存储桶 IAM**：DMS 服务代理和 Cloud SQL 实例服务账号获得 `roles/storage.objectViewer` + `roles/storage.legacyBucketReader`；`backup_writer_members` 获得 `roles/storage.objectCreator`。无需手动输入服务代理的电子邮件地址。 在 `DMS_MANAGED_CLOUDSQL` 模式下，实例由 DMS 在 apply 之后创建，因此请在 `verify` 之前自行为其服务账号授予这两个读取角色：`gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer`（再使用 `roles/storage.legacyBucketReader` 重复执行一次）。
+- **自动配置存储桶 IAM**：DMS 服务代理和 Cloud SQL 实例服务账号获得 `roles/storage.objectViewer` + `roles/storage.legacyBucketReader`；`backup_writer_members` 获得 `roles/storage.objectCreator` + `roles/storage.objectViewer`。无需手动输入服务代理的电子邮件地址。 在 `DMS_MANAGED_CLOUDSQL` 模式下，实例由 DMS 在 apply 之后创建，因此请在 `verify` 之前自行为其服务账号授予这两个读取角色：`gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer`（再使用 `roles/storage.legacyBucketReader` 重复执行一次）。
 - **严格遵循 Terraform Schema（`dump_path` 与 `dump_flags`）**：遵循 Google Terraform Provider 的要求，即在 `google_database_migration_service_migration_job` 上 `dump_path` 与 `dump_flags` 互斥。
 
 ### 支持矩阵
@@ -57,7 +57,7 @@ flowchart LR
 
 ## 使用说明
 
-请先完成[前提条件](../../README.zh-CN.md#3-前提条件)（包括 `gcloud beta services identity create --service=datamigration.googleapis.com`）以及[运维手册第 2 节](../../docs/gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md)中的源端准备工作。顺序为：**apply → 生成初始数据 → verify → start**。
+请先完成[前提条件](../../README.zh-CN.md#3-前提条件)（包括 `gcloud beta services identity create --service=datamigration.googleapis.com`）以及[运维手册第 2 节](../../docs/gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md)中的源端准备工作（`make preflight` 不得报告任何 FAIL）。顺序为：**使用 `create_migration_job = false` 执行 apply → 生成初始数据 → 再次 apply（创建作业）→ 用户、授权、DEFINER 与参数（运维手册第 5 节）→ verify → start**。场景 2 需要执行两次 apply，因为在初始数据写入 `dump_path` 之前，DMS 会以 "The supplied dump file doesn't exist" 拒绝创建作业。
 
 ### 1. 配置变量
 
@@ -74,7 +74,8 @@ export TF_VAR_source_gce_mysql_password='REPLACE_ME_MAX_32_CHARS'
 ```bash
 terraform init
 terraform validate
-terraform plan -out=tfplan
+# Phase 1: everything except the migration job (DMS checks dump_path when the job is created)
+terraform plan -var create_migration_job=false -out=tfplan
 terraform apply tfplan
 
 # The single seed location configured on the migration job
@@ -103,7 +104,13 @@ sudo -E ./scripts/xtrabackup_to_gcs.sh
 
 ### 4. 验证并启动 DMS 备份 + CDC 迁移作业
 
+初始数据完整写入后，通过第二次 apply 创建作业，然后完成运维手册第 5 节。在 `start` 与 `promote` 之间不要运行 `terraform apply`：DMS 会更改目标实例的备份与恢复设置（运维手册第 6 节）。
+
 ```bash
+# Phase 2 (after the seed is complete): create the migration job and demote the destination
+terraform plan -out=tfplan
+terraform apply tfplan
+
 # Verify connection profiles, GCS permissions, and GTID replication topology
 gcloud database-migration migration-jobs verify gcs-bkp-mysql80-cdc \
   --region=europe-west2
@@ -115,11 +122,11 @@ gcloud database-migration migration-jobs start gcs-bkp-mysql80-cdc \
 
 ### 5. 切换 / 提升
 
-在 Cloud Monitoring 中监控 `datamigration.googleapis.com/migration_job/max_replica_sec_lag`。在计划的维护窗口内，当复制延迟接近 `0` 时，停止应用对源 MySQL 8.0 的写入，并提升 Cloud SQL：
+使用 `make lag`（`max_replica_sec_lag`；设置了 `CLOUDSQL_INSTANCE` 时会回退到目标实例的 `replica_lag`）或在 Cloud Monitoring 中监控复制延迟。在计划的维护窗口内，当复制延迟接近 `0` 时，停止应用对源 MySQL 8.0 的写入，完成 Go / No-Go 检查清单和回退决策（运维手册第 8 节），然后提升 Cloud SQL：
 
 ```bash
 gcloud database-migration migration-jobs promote gcs-bkp-mysql80-cdc \
   --region=europe-west2
 ```
 
-然后将应用指向 Terraform 输出 `psc_endpoint_dns_name`。
+然后将应用指向 Terraform 输出 `psc_endpoint_dns_name`，并运行 `terraform plan`/`apply`（运维手册第 9.1 节）。如需清理与下线（最后删除暂存存储桶），请参阅运维手册第 10 节。

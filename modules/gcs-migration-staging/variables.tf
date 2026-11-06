@@ -32,7 +32,7 @@ variable "reader_members" {
 }
 
 variable "backup_writer_members" {
-  description = "List of IAM principals (for example ['serviceAccount:mysql-backup@my-project.iam.gserviceaccount.com']) granted roles/storage.objectCreator to upload the Percona XtraBackup folder or mysqldump file."
+  description = "List of IAM principals (for example ['serviceAccount:mysql-backup@my-project.iam.gserviceaccount.com']) granted roles/storage.objectCreator + roles/storage.objectViewer to upload the Percona XtraBackup folder or mysqldump file."
   type        = list(string)
   default     = []
 }

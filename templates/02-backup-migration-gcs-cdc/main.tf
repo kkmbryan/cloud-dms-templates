@@ -26,14 +26,15 @@ locals {
 module "networking" {
   source = "../../modules/networking-psc"
 
-  project_id            = var.project_id
-  region                = var.region
-  connectivity_type     = var.connectivity_type
-  network               = var.network
-  subnet                = var.subnet
-  dms_tenant_project_id = var.dms_tenant_project_id
-  create_psa_peering    = var.create_psa_peering
-  labels                = var.labels
+  project_id              = var.project_id
+  region                  = var.region
+  connectivity_type       = var.connectivity_type
+  network                 = var.network
+  subnet                  = var.subnet
+  network_attachment_name = var.network_attachment_name
+  dms_tenant_project_id   = var.dms_tenant_project_id
+  create_psa_peering      = var.create_psa_peering
+  labels                  = var.labels
 }
 
 # 2. Cloud SQL for MySQL destination instance (MYSQL_8_4 default or MYSQL_8_0)
@@ -57,6 +58,7 @@ module "cloudsql_destination" {
   disk_size_gb               = var.cloudsql_disk_size_gb
   root_password              = var.cloudsql_root_password
   root_password_wo_version   = var.cloudsql_root_password_version
+  lower_case_table_names     = var.cloudsql_lower_case_table_names
   deletion_protection        = var.cloudsql_deletion_protection
   labels                     = var.labels
 }
@@ -125,9 +127,13 @@ module "dms_connection_profiles" {
   labels                = var.labels
 }
 
-# 6. Cloud DMS continuous migration job seeded from GCS (dump_path) + binlog CDC
+# 6. Cloud DMS continuous migration job seeded from GCS (dump_path) + binlog CDC.
+#    DMS checks that the seed exists at dump_path when the job is created, so
+#    run a first apply with create_migration_job = false, upload the seed to
+#    configured_dump_path, then apply again with create_migration_job = true.
 module "dms_migration_job" {
   source = "../../modules/dms-migration-job"
+  count  = var.create_migration_job ? 1 : 0
 
   # Bucket IAM must exist before `verify`/`start`; make the job wait for it.
   depends_on = [module.gcs_migration_staging]

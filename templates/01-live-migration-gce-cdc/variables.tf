@@ -31,6 +31,12 @@ variable "subnet" {
   default     = ""
 }
 
+variable "network_attachment_name" {
+  description = "Name of the PSC Network Attachment. Use a different name per stack when several migrations share a project and region."
+  type        = string
+  default     = "dms-mysql-psc-na"
+}
+
 variable "dms_tenant_project_id" {
   description = "Optional Google-managed DMS/Cloud SQL tenant project ID (e.g., 'p123456-abcdef-tp') to add to the PSC Network Attachment producer_accept_lists."
   type        = string
@@ -103,7 +109,7 @@ variable "cloudsql_disk_size_gb" {
 }
 
 variable "cloudsql_root_password" {
-  description = "Initial root password for the destination Cloud SQL instance. Sent through the write-only root_password_wo argument (EXISTING_CLOUDSQL), so it is not stored in Terraform state."
+  description = "Initial root password for the destination Cloud SQL instance. Applied to root@'%' through the write-only password_wo argument of google_sql_user (EXISTING_CLOUDSQL), so it is not stored in Terraform state."
   type        = string
   sensitive   = true
 }
@@ -112,6 +118,12 @@ variable "cloudsql_root_password_version" {
   description = "Version of the write-only Cloud SQL root password. Increment it to push a new cloudsql_root_password to the instance (the password is never stored in Terraform state)."
   type        = number
   default     = 1
+}
+
+variable "cloudsql_lower_case_table_names" {
+  description = "Optional lower_case_table_names for the destination (0 or 1). IMMUTABLE after the instance is created. Set it to the source value (SELECT @@lower_case_table_names). Null keeps the Cloud SQL default (0)."
+  type        = number
+  default     = null
 }
 
 variable "cloudsql_deletion_protection" {
