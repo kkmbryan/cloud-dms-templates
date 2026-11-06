@@ -42,6 +42,11 @@ DEALLOCATE PREPARE create_dms_user;
 SET @stmt = NULL;
 
 -- Scenario 1 (DMS-managed dump):
+--   Required by DMS: REPLICATION SLAVE, REPLICATION CLIENT, EXECUTE, SELECT,
+--                    SHOW VIEW, TRIGGER, RELOAD.
+--   Recommended extra (events / parallel dump): EVENT, LOCK TABLES.
+--   preflight_check.sh FAILs on a missing required privilege and WARNs on a
+--   missing recommended extra.
 GRANT REPLICATION SLAVE, REPLICATION CLIENT, EXECUTE, SELECT, SHOW VIEW, TRIGGER, EVENT, RELOAD, LOCK TABLES
   ON *.* TO 'dms_migration'@'%';
 

@@ -149,7 +149,7 @@ variable "root_password_wo_version" {
 }
 
 variable "lower_case_table_names" {
-  description = "Optional lower_case_table_names flag (0 or 1). IMMUTABLE: Cloud SQL for MySQL 8.0+ accepts it only when the instance is created; changing it later replaces the instance. Match the source value. Null leaves the Cloud SQL default (0)."
+  description = "Optional lower_case_table_names flag (0 or 1). IMMUTABLE: Cloud SQL for MySQL 8.0+ accepts it only when the instance is created; the API rejects later changes, so set it before the first apply. Match the source value. Null leaves the Cloud SQL default (0)."
   type        = number
   default     = null
 

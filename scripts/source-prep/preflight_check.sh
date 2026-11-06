@@ -179,14 +179,14 @@ first_items() {
 VARS="$(q "/* chk:vars */ SELECT CONCAT_WS(CHAR(31),
   @@GLOBAL.version, @@GLOBAL.server_id, @@GLOBAL.log_bin, @@GLOBAL.binlog_format,
   @@GLOBAL.binlog_row_image, @@GLOBAL.gtid_mode, @@GLOBAL.enforce_gtid_consistency,
-  @@GLOBAL.binlog_expire_logs_seconds,
+  @@GLOBAL.binlog_expire_logs_seconds, @@GLOBAL.expire_logs_days,
   @@GLOBAL.lower_case_table_names, @@GLOBAL.character_set_server,
   @@GLOBAL.collation_server, @@GLOBAL.sql_mode, @@GLOBAL.time_zone,
   @@GLOBAL.system_time_zone, @@GLOBAL.innodb_page_size, IFNULL(@@GLOBAL.bind_address, ''))")" ||
   die "cannot connect to MySQL with ${DEFAULTS_FILE} (see the error above)"
 
 IFS=$'\x1f' read -r V_VERSION V_SERVER_ID V_LOG_BIN V_BINLOG_FORMAT V_ROW_IMAGE V_GTID_MODE \
-  V_ENFORCE_GTID V_EXPIRE_SECONDS V_LCTN V_CHARSET V_COLLATION V_SQL_MODE \
+  V_ENFORCE_GTID V_EXPIRE_SECONDS V_EXPIRE_DAYS V_LCTN V_CHARSET V_COLLATION V_SQL_MODE \
   V_TIME_ZONE V_SYSTEM_TZ V_PAGE_SIZE V_BIND_ADDRESS <<<"${VARS}"
 
 # MySQL version.
@@ -259,24 +259,35 @@ fi
 SEED_SECONDS=$((SEED_HOURS * 3600))
 RECOMMENDED=$(((SEED_HOURS + RETENTION_BUFFER_HOURS) * 3600))
 ((RECOMMENDED < MIN_RETENTION_SECONDS)) && RECOMMENDED=${MIN_RETENTION_SECONDS}
+# binlog_expire_logs_seconds takes precedence; when it is 0, MySQL 8.0 still
+# purges after expire_logs_days (deprecated) if that is > 0.
 RETENTION="${V_EXPIRE_SECONDS}"
+RETENTION_SOURCE="binlog_expire_logs_seconds"
+if [[ "${RETENTION}" == "0" && "${V_EXPIRE_DAYS}" =~ ^[1-9][0-9]*$ ]]; then
+  RETENTION=$((V_EXPIRE_DAYS * 86400))
+  RETENTION_SOURCE="expire_logs_days=${V_EXPIRE_DAYS}"
+fi
 if [[ "${RETENTION}" == "0" ]]; then
-  add PASS "binlog_retention" "no automatic purge (binlog_expire_logs_seconds=0); watch disk space"
+  add PASS "binlog_retention" "no automatic purge (binlog_expire_logs_seconds=0, expire_logs_days=0); watch disk space"
 elif ((RETENTION < SEED_SECONDS)); then
-  add FAIL "binlog_retention" "${RETENTION}s < seed time ${SEED_SECONDS}s (--seed-hours ${SEED_HOURS}); set binlog_expire_logs_seconds >= ${RECOMMENDED}"
+  add FAIL "binlog_retention" "${RETENTION}s (${RETENTION_SOURCE}) < seed time ${SEED_SECONDS}s (--seed-hours ${SEED_HOURS}); set binlog_expire_logs_seconds >= ${RECOMMENDED}"
 elif ((RETENTION < RECOMMENDED)); then
-  add WARN "binlog_retention" "${RETENTION}s; recommended >= ${RECOMMENDED}s (seed ${SEED_HOURS}h + ${RETENTION_BUFFER_HOURS}h buffer, 7 days minimum)"
+  add WARN "binlog_retention" "${RETENTION}s (${RETENTION_SOURCE}); recommended >= ${RECOMMENDED}s (seed ${SEED_HOURS}h + ${RETENTION_BUFFER_HOURS}h buffer, 7 days minimum)"
 else
-  add PASS "binlog_retention" "${RETENTION}s >= ${RECOMMENDED}s (seed ${SEED_HOURS}h + ${RETENTION_BUFFER_HOURS}h buffer, 7 days minimum)"
+  add PASS "binlog_retention" "${RETENTION}s (${RETENTION_SOURCE}) >= ${RECOMMENDED}s (seed ${SEED_HOURS}h + ${RETENTION_BUFFER_HOURS}h buffer, 7 days minimum)"
 fi
 
 # ------------------------------------------------------------------------------
 # DMS user grants.
 # ------------------------------------------------------------------------------
 if [[ "${SCENARIO}" == "1" ]]; then
-  REQUIRED_PRIVS=("REPLICATION SLAVE" "REPLICATION CLIENT" "EXECUTE" "SELECT" "SHOW VIEW" "TRIGGER" "EVENT" "RELOAD" "LOCK TABLES")
+  # Required by the DMS "Configure your source database" doc (FAIL if missing).
+  REQUIRED_PRIVS=("REPLICATION SLAVE" "REPLICATION CLIENT" "EXECUTE" "SELECT" "SHOW VIEW" "TRIGGER" "RELOAD")
+  # Recommended extra (events / parallel dump; WARN if missing).
+  RECOMMENDED_PRIVS=("EVENT" "LOCK TABLES")
 else
   REQUIRED_PRIVS=("REPLICATION SLAVE" "REPLICATION CLIENT" "EXECUTE")
+  RECOMMENDED_PRIVS=()
 fi
 
 USER_EXISTS="$(q "/* chk:dms_user_exists */ SELECT COUNT(*) FROM mysql.user WHERE User = '${DMS_USER}' AND Host = '${DMS_HOST}'")"
@@ -294,19 +305,28 @@ else
       MISSING+=("${p}")
     fi
   done
+  MISSING_EXTRA=()
+  for p in "${RECOMMENDED_PRIVS[@]}"; do
+    if [[ "${HAS_ALL}" == "0" ]] && ! grep -qx "${p}" <<<"${GLOBAL_PRIVS}"; then
+      MISSING_EXTRA+=("${p}")
+    fi
+  done
   PROBLEMS=()
   if grep -qx 'BACKUP_ADMIN' <<<"${GLOBAL_PRIVS}"; then
     PROBLEMS+=("has BACKUP_ADMIN, which DMS rejects (REVOKE BACKUP_ADMIN ON *.* FROM '${DMS_USER}'@'%')")
   fi
   if [[ ${#MISSING[@]} -gt 0 ]]; then
     MISSING_LIST="$(printf '%s, ' "${MISSING[@]}")"
-    PROBLEMS+=("missing scenario ${SCENARIO} privileges on *.*: ${MISSING_LIST%, }")
+    PROBLEMS+=("missing required scenario ${SCENARIO} privileges on *.*: ${MISSING_LIST%, }")
   fi
   if [[ ${#PROBLEMS[@]} -gt 0 ]]; then
     PROBLEM_LIST="$(printf '%s; ' "${PROBLEMS[@]}")"
     add FAIL "dms_user_grants" "'${DMS_USER}'@'%' ${PROBLEM_LIST%; }"
   elif [[ "${HAS_ALL}" == "1" ]]; then
     add WARN "dms_user_grants" "'${DMS_USER}'@'%' has ALL PRIVILEGES; grant only the scenario ${SCENARIO} privileges"
+  elif [[ ${#MISSING_EXTRA[@]} -gt 0 ]]; then
+    EXTRA_LIST="$(printf '%s, ' "${MISSING_EXTRA[@]}")"
+    add WARN "dms_user_grants" "'${DMS_USER}'@'%' has the required scenario ${SCENARIO} privileges; missing recommended extra ${EXTRA_LIST%, } (events / parallel dump)"
   else
     add PASS "dms_user_grants" "'${DMS_USER}'@'%' has the scenario ${SCENARIO} privileges, no BACKUP_ADMIN"
   fi

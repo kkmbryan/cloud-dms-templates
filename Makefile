@@ -128,8 +128,8 @@ export LAG_PY
 
 lag:
 	@set -euo pipefail; \
-	start="$$(date -u -d "-$(LAG_MINUTES) minutes" +%Y-%m-%dT%H:%M:%SZ)"; \
-	end="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+	start="$$(python3 -c 'import datetime as d, sys; print((d.datetime.now(d.timezone.utc) - d.timedelta(minutes=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$(LAG_MINUTES)")"; \
+	end="$$(python3 -c 'import datetime as d; print(d.datetime.now(d.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))')"; \
 	query() { \
 		$(ACCESS_TOKEN_CMD) | sed 's/^/Authorization: Bearer /' | \
 		curl -sS --fail -G -H @- \

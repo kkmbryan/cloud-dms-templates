@@ -121,7 +121,7 @@ Use two separate accounts (`scripts/source-prep/03_create_dms_user.sql` creates 
 
 | Account | Used by | Host | Privileges |
 | :--- | :--- | :--- | :--- |
-| `dms_migration` | DMS source connection profile (Terraform `source_gce_mysql_username`) | `'%'` (required by DMS) | Scenario 1: `REPLICATION SLAVE`, `REPLICATION CLIENT`, `EXECUTE`, `SELECT`, `SHOW VIEW`, `TRIGGER`, `EVENT`, `RELOAD`, `LOCK TABLES`. Scenario 2 (CDC only): `REPLICATION SLAVE`, `REPLICATION CLIENT`, `EXECUTE`. **Never** `BACKUP_ADMIN`. |
+| `dms_migration` | DMS source connection profile (Terraform `source_gce_mysql_username`) | `'%'` (required by DMS) | Scenario 1: `REPLICATION SLAVE`, `REPLICATION CLIENT`, `EXECUTE`, `SELECT`, `SHOW VIEW`, `TRIGGER`, `RELOAD`; recommended extra (events / parallel dump): `EVENT`, `LOCK TABLES`. Scenario 2 (CDC only): `REPLICATION SLAVE`, `REPLICATION CLIENT`, `EXECUTE`. **Never** `BACKUP_ADMIN`. |
 | `xtrabackup` | `xtrabackup_to_gcs.sh` on the source VM (Scenario 2 `PHYSICAL` only) | `'localhost'` | `BACKUP_ADMIN`, `PROCESS`, `RELOAD`, `LOCK TABLES`, `REPLICATION CLIENT`, plus `SELECT` on `performance_schema.log_status` and `performance_schema.keyring_component_status` |
 
 Connect to the source MySQL 8.0 instance as an administrative user and run:
@@ -130,7 +130,9 @@ Connect to the source MySQL 8.0 instance as an administrative user and run:
 -- 1) DMS migration user. DMS requires host '%' and a password of 32 characters or fewer.
 CREATE USER IF NOT EXISTS 'dms_migration'@'%' IDENTIFIED BY 'REPLACE_ME_MAX_32_CHARS';
 
--- Scenario 1 (DMS-managed dump):
+-- Scenario 1 (DMS-managed dump). Required by DMS: REPLICATION SLAVE, REPLICATION CLIENT,
+-- EXECUTE, SELECT, SHOW VIEW, TRIGGER, RELOAD. Recommended extra: EVENT (events),
+-- LOCK TABLES (parallel dump); make preflight WARNs, not FAILs, when they are missing.
 GRANT REPLICATION SLAVE, REPLICATION CLIENT, EXECUTE, SELECT, SHOW VIEW, TRIGGER, EVENT, RELOAD, LOCK TABLES
   ON *.* TO 'dms_migration'@'%';
 
@@ -187,7 +189,7 @@ Both templates default to **Private Service Connect (`connectivity_type = "PSC"`
 Complete the [Prerequisites](../README.md#3-prerequisites) and Phase 1 first. The order is: Scenario 1 **apply → users, grants, DEFINERs and flags (section 5) → verify → start (section 6)**; Scenario 2 **apply with `create_migration_job = false` → produce the seed → apply (creates the job) → section 5 → verify → start**.
 
 > [!IMPORTANT]
-> Decide `cloudsql_lower_case_table_names` **before the first apply**. Cloud SQL for MySQL 8.0 and later accepts `lower_case_table_names` only when the instance is created, and you can't change it afterwards. Set it to the source value (`SELECT @@lower_case_table_names;`, also reported by `make preflight`); leave it `null` to keep the Cloud SQL default (`0`). See [Configure database flags](https://cloud.google.com/sql/docs/mysql/flags).
+> Decide `cloudsql_lower_case_table_names` **before the first apply**. Cloud SQL for MySQL 8.0 and later accepts `lower_case_table_names` only when the instance is created; the API rejects later changes, so set it at creation. Set it to the source value (`SELECT @@lower_case_table_names;`, also reported by `make preflight`); leave it `null` to keep the Cloud SQL default (`0`). See [Configure database flags](https://cloud.google.com/sql/docs/mysql/flags).
 
 ### Option A: Scenario 1 — Live Migration + Continuous CDC (`templates/01-live-migration-gce-cdc`)
 
@@ -350,7 +352,7 @@ DMS doesn't migrate user accounts, logins or the `mysql` system database, and it
      SELECT GTID_SUBSET('<source gtid_executed>', @@GLOBAL.gtid_executed) AS caught_up;
      ```
 4. **Validate Data with the Data Validation Tool (optional)**:
-   - The [Data Validation Tool (DVT)](https://github.com/GoogleCloudPlatform/professional-services-data-validator) compares row counts (and optionally aggregates, rows and schemas) between source and destination. Install it on a host that reaches both databases, create the two connections once, then run count validation with `make validate-data`. With `--secret-manager-type GCP`, `--password` takes a Secret Manager secret name instead of the password. Run the final comparison after the source is read-only (section 8).
+   - The [Data Validation Tool (DVT)](https://github.com/GoogleCloudPlatform/professional-services-data-validator) compares row counts (and optionally aggregates, rows and schemas) between source and destination. Install it on a host that reaches both databases, create the two connections once, then run count validation with `make validate-data`. With `--secret-manager-type GCP`, only `--password` is a Secret Manager secret name; host, port and user are literal values (DVT uses the literal value when no secret of that name exists). Run the final comparison after the source is read-only (section 8).
    ```bash
    pip install google-pso-data-validator
 
@@ -429,7 +431,7 @@ Don't apply a plan that replaces or destroys `module.cloudsql_destination`. To k
 
 ### 9.2 Major Version Upgrade Path
 
-- If you migrated to **`MYSQL_8_0`** (for example, to keep the section 8.2 fallback), you can upgrade in place to **`MYSQL_8_4`** by setting `target_database_version = "MYSQL_8_4"` and running `terraform apply`, or with `gcloud sql instances patch --database-version`.
+- If you migrated to **`MYSQL_8_0`** (for example, to keep the section 8.2 fallback), you can upgrade in place to **`MYSQL_8_4`** by setting `target_database_version = "MYSQL_8_4"` and running `terraform apply`, or with `gcloud sql instances patch --database-version`. On a stack that still contains the migration objects, retire them first (section 10.2), so the upgrade plan touches only the instance. In template 02, the `dump_type = "PHYSICAL"` validation rejects `target_database_version = "MYSQL_8_4"`: set `dump_type = "LOGICAL"`, or remove the stack's DMS objects, before you change the version.
 - Upgrades go one major version at a time; MySQL doesn't support skipping major versions. Later major versions follow the same path: check which versions Cloud SQL offers in [Database versions and version policies](https://cloud.google.com/sql/docs/mysql/db-versions).
 - A major version upgrade **makes the instance unavailable for a period of time**. Plan a maintenance window, run the upgrade precheck (Preview), and do a dry run on a clone first. See [Upgrade the database major version in-place](https://cloud.google.com/sql/docs/mysql/upgrade-major-db-version-inplace).
 

@@ -245,5 +245,6 @@ fi
 echo "=============================================================================="
 echo "[SUCCESS] Prepared XtraBackup uploaded to ${GCS_BACKUP_FOLDER}"
 echo "          This must equal the migration job dump_path (Terraform output configured_dump_path)."
-echo "          Next: gcloud database-migration migration-jobs verify <job> --region=<region>"
+echo "          Next: terraform apply (create_migration_job = true) to create the job, then"
+echo "                gcloud database-migration migration-jobs verify <job> --region=<region>"
 echo "=============================================================================="

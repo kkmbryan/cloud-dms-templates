@@ -57,7 +57,7 @@ SET @xtrabackup_password = 'REPLACE_WITH_SECURE_PASSWORD';  -- Scenario 2 PHYSIC
 SOURCE scripts/source-prep/03_create_dms_user.sql
 ```
 
-The file grants the Scenario 1 privileges. For Scenario 2, comment out the Scenario 1 `GRANT` and uncomment the Scenario 2 `GRANT` first. The `xtrabackup` user is created only when `@xtrabackup_password` is set. Don't grant `BACKUP_ADMIN` to `dms_migration`, and you don't need `FLUSH PRIVILEGES`.
+The file grants the Scenario 1 privileges: the set required by DMS (`REPLICATION SLAVE`, `REPLICATION CLIENT`, `EXECUTE`, `SELECT`, `SHOW VIEW`, `TRIGGER`, `RELOAD`) plus the recommended extra `EVENT` and `LOCK TABLES` (events / parallel dump). For Scenario 2, comment out the Scenario 1 `GRANT` and uncomment the Scenario 2 `GRANT` first. The `xtrabackup` user is created only when `@xtrabackup_password` is set. Don't grant `BACKUP_ADMIN` to `dms_migration`, and you don't need `FLUSH PRIVILEGES`.
 
 ---
 
@@ -118,8 +118,8 @@ Exit codes: `0` no FAIL (WARNs allowed), `1` at least one FAIL, `2` usage, optio
 | `binlog_row_image` | Not `FULL` | — |
 | `gtid_mode` | Not `ON` (`OFF_PERMISSIVE` and `ON_PERMISSIVE` included) | — |
 | `enforce_gtid_consistency` | Not `ON` | — |
-| `binlog_retention` | `binlog_expire_logs_seconds` < seed time | < seed time + 24 h buffer, or < 7 days |
-| `dms_user_grants` | User `'<dms-user>'@'%'` missing, a scenario privilege missing, or `BACKUP_ADMIN` present | `ALL PRIVILEGES` granted |
+| `binlog_retention` | Retention < seed time (`binlog_expire_logs_seconds`, or `expire_logs_days` × 86400 when the former is `0`) | < seed time + 24 h buffer, or < 7 days |
+| `dms_user_grants` | User `'<dms-user>'@'%'` missing, a required scenario privilege missing, or `BACKUP_ADMIN` present | `ALL PRIVILEGES` granted, or Scenario 1 recommended extra `EVENT` / `LOCK TABLES` missing |
 | `non_innodb_tables` | — | User tables that aren't InnoDB |
 | `primary_keys` | — | User tables without a primary key or a unique `NOT NULL` key |
 | `definers` | — | Events, routines, triggers or views whose DEFINER doesn't exist or is `root@localhost` |
@@ -148,17 +148,17 @@ make lag PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql8
   CLOUDSQL_INSTANCE="$(terraform -chdir=templates/01-live-migration-gce-cdc output -raw cloudsql_instance_name)"
 ```
 
-Optionally, compare row counts between the source and the Cloud SQL destination with the open-source [Data Validation Tool](https://github.com/GoogleCloudPlatform/professional-services-data-validator) (DVT). DVT isn't required by the templates. Install it in a virtual environment on a host that can reach both databases, and store the connection details in Secret Manager instead of on the command line:
+Optionally, compare row counts between the source and the Cloud SQL destination with the open-source [Data Validation Tool](https://github.com/GoogleCloudPlatform/professional-services-data-validator) (DVT). DVT isn't required by the templates. Install it in a virtual environment on a host that can reach both databases, and store the database passwords in Secret Manager instead of on the command line. With `--secret-manager-type GCP`, `--password` is a secret name; host, port and user are literal values (DVT uses the literal value when no secret with that name exists):
 
 ```bash
 python3 -m venv ~/dvt && . ~/dvt/bin/activate
 pip install google-pso-data-validator
 
-# --host, --user and --password take Secret Manager secret names here
+# --password is a Secret Manager secret name; --host, --port and --user are literal values
 data-validation connections add --secret-manager-type GCP --secret-manager-project-id my-gcp-project-01 \
-  --connection-name dms_src MySQL --host dms-src-host --port 3306 --user dms-src-user --password dms-src-password
+  --connection-name dms_src MySQL --host 10.10.0.10 --port 3306 --user dvt_reader --password dvt-src-password
 data-validation connections add --secret-manager-type GCP --secret-manager-project-id my-gcp-project-01 \
-  --connection-name dms_tgt MySQL --host dms-tgt-host --port 3306 --user dms-tgt-user --password dms-tgt-password
+  --connection-name dms_tgt MySQL --host "<psc_endpoint_dns_name>" --port 3306 --user dvt_reader --password dvt-tgt-password
 
 make validate-data DVT_SOURCE_CONN=dms_src DVT_TARGET_CONN=dms_tgt DVT_TABLES='app_db1.orders,app_db1.customers'
 ```

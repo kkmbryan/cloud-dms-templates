@@ -121,7 +121,7 @@ SHOW GLOBAL VARIABLES WHERE Variable_name IN (
 
 | 账号 | 使用方 | 主机 | 权限 |
 | :--- | :--- | :--- | :--- |
-| `dms_migration` | DMS 源连接配置文件（Terraform `source_gce_mysql_username`） | `'%'`（DMS 要求） | 场景 1：`REPLICATION SLAVE`、`REPLICATION CLIENT`、`EXECUTE`、`SELECT`、`SHOW VIEW`、`TRIGGER`、`EVENT`、`RELOAD`、`LOCK TABLES`。场景 2（仅 CDC）：`REPLICATION SLAVE`、`REPLICATION CLIENT`、`EXECUTE`。**切勿**授予 `BACKUP_ADMIN`。 |
+| `dms_migration` | DMS 源连接配置文件（Terraform `source_gce_mysql_username`） | `'%'`（DMS 要求） | 场景 1：`REPLICATION SLAVE`、`REPLICATION CLIENT`、`EXECUTE`、`SELECT`、`SHOW VIEW`、`TRIGGER`、`RELOAD`；建议额外授予（用于事件 / 并行转储）：`EVENT`、`LOCK TABLES`。场景 2（仅 CDC）：`REPLICATION SLAVE`、`REPLICATION CLIENT`、`EXECUTE`。**切勿**授予 `BACKUP_ADMIN`。 |
 | `xtrabackup` | 源虚拟机上的 `xtrabackup_to_gcs.sh`（仅场景 2 `PHYSICAL`） | `'localhost'` | `BACKUP_ADMIN`、`PROCESS`、`RELOAD`、`LOCK TABLES`、`REPLICATION CLIENT`，以及 `performance_schema.log_status` 和 `performance_schema.keyring_component_status` 上的 `SELECT` |
 
 以管理员用户身份连接到源 MySQL 8.0 实例并运行：
@@ -130,7 +130,9 @@ SHOW GLOBAL VARIABLES WHERE Variable_name IN (
 -- 1) DMS migration user. DMS requires host '%' and a password of 32 characters or fewer.
 CREATE USER IF NOT EXISTS 'dms_migration'@'%' IDENTIFIED BY 'REPLACE_ME_MAX_32_CHARS';
 
--- Scenario 1 (DMS-managed dump):
+-- Scenario 1 (DMS-managed dump). Required by DMS: REPLICATION SLAVE, REPLICATION CLIENT,
+-- EXECUTE, SELECT, SHOW VIEW, TRIGGER, RELOAD. Recommended extra: EVENT (events),
+-- LOCK TABLES (parallel dump); make preflight WARNs, not FAILs, when they are missing.
 GRANT REPLICATION SLAVE, REPLICATION CLIENT, EXECUTE, SELECT, SHOW VIEW, TRIGGER, EVENT, RELOAD, LOCK TABLES
   ON *.* TO 'dms_migration'@'%';
 
@@ -187,7 +189,7 @@ MYSQL_DEFAULTS_FILE=~/.my-dms.cnf ./scripts/source-prep/preflight_check.sh \
 请先完成[前提条件](../README.zh-CN.md#3-前提条件)和阶段 1。顺序为：场景 1 **apply → 用户、授权、DEFINER 与参数（第 5 节）→ verify → start（第 6 节）**；场景 2 **使用 `create_migration_job = false` 执行 apply → 生成初始数据 → apply（创建作业）→ 第 5 节 → verify → start**。
 
 > [!IMPORTANT]
-> 请在**首次 apply 之前**确定 `cloudsql_lower_case_table_names`。Cloud SQL for MySQL 8.0 及更高版本只在创建实例时接受 `lower_case_table_names`，之后无法更改。请将其设置为源端的值（`SELECT @@lower_case_table_names;`，`make preflight` 也会报告该值）；保留为 `null` 则使用 Cloud SQL 默认值（`0`）。请参阅[配置数据库参数](https://cloud.google.com/sql/docs/mysql/flags)。
+> 请在**首次 apply 之前**确定 `cloudsql_lower_case_table_names`。Cloud SQL for MySQL 8.0 及更高版本只在创建实例时接受 `lower_case_table_names`；之后 API 会拒绝任何更改，因此请在创建时设置。请将其设置为源端的值（`SELECT @@lower_case_table_names;`，`make preflight` 也会报告该值）；保留为 `null` 则使用 Cloud SQL 默认值（`0`）。请参阅[配置数据库参数](https://cloud.google.com/sql/docs/mysql/flags)。
 
 ### 方案 A：场景 1 — 在线迁移 + 持续 CDC（`templates/01-live-migration-gce-cdc`）
 
@@ -350,7 +352,7 @@ DMS 不会迁移用户账号、登录信息或 `mysql` 系统数据库，也不�
      SELECT GTID_SUBSET('<source gtid_executed>', @@GLOBAL.gtid_executed) AS caught_up;
      ```
 4. **使用 Data Validation Tool 验证数据（可选）**：
-   - [Data Validation Tool (DVT)](https://github.com/GoogleCloudPlatform/professional-services-data-validator) 可比较源端与目标实例之间的行数（以及可选的聚合值、行和架构）。请在能够同时访问两个数据库的主机上安装该工具，一次性创建两个连接，然后使用 `make validate-data` 运行行数验证。使用 `--secret-manager-type GCP` 时，`--password` 接受的是 Secret Manager 密文名称，而不是密码本身。请在源端设为只读后执行最终比较（第 8 节）。
+   - [Data Validation Tool (DVT)](https://github.com/GoogleCloudPlatform/professional-services-data-validator) 可比较源端与目标实例之间的行数（以及可选的聚合值、行和架构）。请在能够同时访问两个数据库的主机上安装该工具，一次性创建两个连接，然后使用 `make validate-data` 运行行数验证。使用 `--secret-manager-type GCP` 时，只有 `--password` 是 Secret Manager 密文名称；host、port 和 user 均为字面值（如果不存在同名密文，DVT 会使用字面值）。请在源端设为只读后执行最终比较（第 8 节）。
    ```bash
    pip install google-pso-data-validator
 
@@ -429,7 +431,7 @@ terraform apply tfplan
 
 ### 9.2 主版本升级路径
 
-- 如果您迁移到了 **`MYSQL_8_0`**（例如为了保留第 8.2 节中的回退能力），可以将 `target_database_version = "MYSQL_8_4"` 后运行 `terraform apply`，或使用 `gcloud sql instances patch --database-version`，将实例就地升级到 **`MYSQL_8_4`**。
+- 如果您迁移到了 **`MYSQL_8_0`**（例如为了保留第 8.2 节中的回退能力），可以将 `target_database_version = "MYSQL_8_4"` 后运行 `terraform apply`，或使用 `gcloud sql instances patch --database-version`，将实例就地升级到 **`MYSQL_8_4`**。如果栈中仍包含迁移相关对象，请先将其下线（第 10.2 节），使升级计划只涉及实例本身。在模板 02 中，`dump_type = "PHYSICAL"` 的验证会拒绝 `target_database_version = "MYSQL_8_4"`：请在更改版本之前设置 `dump_type = "LOGICAL"`，或移除栈中的 DMS 对象。
 - 升级每次只能跨一个主版本；MySQL 不支持跨越主版本。之后的主版本也遵循相同路径：请在[数据库版本和版本政策](https://cloud.google.com/sql/docs/mysql/db-versions)中查看 Cloud SQL 提供的版本。
 - 主版本升级**会使实例在一段时间内不可用**。请规划维护窗口，运行升级预检（预览版），并先在克隆实例上进行演练。请参阅[就地升级数据库主版本](https://cloud.google.com/sql/docs/mysql/upgrade-major-db-version-inplace)。
 

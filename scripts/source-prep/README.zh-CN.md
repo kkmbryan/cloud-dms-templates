@@ -57,7 +57,7 @@ SET @xtrabackup_password = 'REPLACE_WITH_SECURE_PASSWORD';  -- Scenario 2 PHYSIC
 SOURCE scripts/source-prep/03_create_dms_user.sql
 ```
 
-该文件授予场景 1 的权限。对于场景 2，请先注释掉场景 1 的 `GRANT`，并取消注释场景 2 的 `GRANT`。仅当设置了 `@xtrabackup_password` 时才会创建 `xtrabackup` 用户。不要向 `dms_migration` 授予 `BACKUP_ADMIN`，也不需要执行 `FLUSH PRIVILEGES`。
+该文件授予场景 1 的权限：DMS 必需的权限集（`REPLICATION SLAVE`、`REPLICATION CLIENT`、`EXECUTE`、`SELECT`、`SHOW VIEW`、`TRIGGER`、`RELOAD`），以及推荐的额外权限 `EVENT` 和 `LOCK TABLES`（用于事件 / 并行转储）。对于场景 2，请先注释掉场景 1 的 `GRANT`，并取消注释场景 2 的 `GRANT`。仅当设置了 `@xtrabackup_password` 时才会创建 `xtrabackup` 用户。不要向 `dms_migration` 授予 `BACKUP_ADMIN`，也不需要执行 `FLUSH PRIVILEGES`。
 
 ---
 
@@ -118,8 +118,8 @@ make preflight MYSQL_DEFAULTS_FILE=~/.my-dms.cnf SCENARIO=2 \
 | `binlog_row_image` | 不是 `FULL` | — |
 | `gtid_mode` | 不是 `ON`（包括 `OFF_PERMISSIVE` 和 `ON_PERMISSIVE`） | — |
 | `enforce_gtid_consistency` | 不是 `ON` | — |
-| `binlog_retention` | `binlog_expire_logs_seconds` < 初始数据耗时 | < 初始数据耗时 + 24 小时缓冲，或 < 7 天 |
-| `dms_user_grants` | 用户 `'<dms-user>'@'%'` 不存在、缺少场景所需权限，或存在 `BACKUP_ADMIN` | 授予了 `ALL PRIVILEGES` |
+| `binlog_retention` | 保留时间 < 初始数据耗时（`binlog_expire_logs_seconds`；当其为 `0` 时使用 `expire_logs_days` × 86400） | < 初始数据耗时 + 24 小时缓冲，或 < 7 天 |
+| `dms_user_grants` | 用户 `'<dms-user>'@'%'` 不存在、缺少场景必需的权限，或存在 `BACKUP_ADMIN` | 授予了 `ALL PRIVILEGES`，或缺少场景 1 推荐的额外权限 `EVENT` / `LOCK TABLES` |
 | `non_innodb_tables` | — | 存在非 InnoDB 的用户表 |
 | `primary_keys` | — | 存在没有主键或唯一 `NOT NULL` 键的用户表 |
 | `definers` | — | 事件、例程、触发器或视图的 DEFINER 不存在或为 `root@localhost` |
@@ -148,17 +148,17 @@ make lag PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql8
   CLOUDSQL_INSTANCE="$(terraform -chdir=templates/01-live-migration-gce-cdc output -raw cloudsql_instance_name)"
 ```
 
-您还可以选择使用开源的 [Data Validation Tool](https://github.com/GoogleCloudPlatform/professional-services-data-validator) (DVT) 比较源与 Cloud SQL 目标之间的行数。这些模板并不依赖 DVT。请在可以同时访问两个数据库的主机上的虚拟环境中安装它，并将连接信息存储在 Secret Manager 中，而不是写在命令行上：
+您还可以选择使用开源的 [Data Validation Tool](https://github.com/GoogleCloudPlatform/professional-services-data-validator) (DVT) 比较源与 Cloud SQL 目标之间的行数。这些模板并不依赖 DVT。请在可以同时访问两个数据库的主机上的虚拟环境中安装它，并将数据库密码存储在 Secret Manager 中，而不是写在命令行上。使用 `--secret-manager-type GCP` 时，`--password` 是 Secret 名称；主机、端口和用户名是字面值（如果不存在同名 Secret，DVT 会使用字面值）：
 
 ```bash
 python3 -m venv ~/dvt && . ~/dvt/bin/activate
 pip install google-pso-data-validator
 
-# --host, --user and --password take Secret Manager secret names here
+# --password is a Secret Manager secret name; --host, --port and --user are literal values
 data-validation connections add --secret-manager-type GCP --secret-manager-project-id my-gcp-project-01 \
-  --connection-name dms_src MySQL --host dms-src-host --port 3306 --user dms-src-user --password dms-src-password
+  --connection-name dms_src MySQL --host 10.10.0.10 --port 3306 --user dvt_reader --password dvt-src-password
 data-validation connections add --secret-manager-type GCP --secret-manager-project-id my-gcp-project-01 \
-  --connection-name dms_tgt MySQL --host dms-tgt-host --port 3306 --user dms-tgt-user --password dms-tgt-password
+  --connection-name dms_tgt MySQL --host "<psc_endpoint_dns_name>" --port 3306 --user dvt_reader --password dvt-tgt-password
 
 make validate-data DVT_SOURCE_CONN=dms_src DVT_TARGET_CONN=dms_tgt DVT_TABLES='app_db1.orders,app_db1.customers'
 ```
