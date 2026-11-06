@@ -95,10 +95,10 @@ resource "google_database_migration_service_migration_job" "migration" {
 resource "terraform_data" "demote_destination" {
   count = local.use_existing_cloudsql && var.demote_destination ? 1 : 0
 
-  # Re-run the demote only when the job itself is replaced.
+  # Re-run the demote only when the job itself is replaced (the job name is the
+  # full projects/.../locations/.../migrationJobs/... path). Keep this list
+  # unchanged across versions so that existing stacks don't re-run the demote.
   triggers_replace = [
-    var.project_id,
-    var.region,
     google_database_migration_service_migration_job.migration.name,
   ]
 

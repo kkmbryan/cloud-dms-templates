@@ -244,6 +244,16 @@ make promote-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-liv
 
 Before you promote, complete the Go / No-Go checklist and the rollback decision in runbook section 8. After promotion, applications connect to `terraform output -raw psc_endpoint_dns_name` (the instance DNS name, resolved by the private zone to the PSC endpoint IP) over TLS; then run `terraform plan`/`apply` (runbook section 9.1). To retire the migration objects and keep Cloud SQL, set `migration_enabled = false` and apply (runbook section 10.2; detaching the Network Attachment restarts the instance).
 
+
+### Upgrading from an Earlier Version
+
+Review `terraform plan` before you apply a stack created with an earlier version of these templates:
+
+- **Firewall rule:** `create_source_firewall_rule = true` is the default and needs `source_target_tags` or `source_target_service_accounts`; otherwise the plan fails a precondition. If you already manage an equivalent rule, set `create_source_firewall_rule = false`.
+- **Network Attachment:** `psc_connection_preference` now defaults to `ACCEPT_MANUAL`, and `dms_tenant_project_id` is removed. The plan updates the existing attachment in place (accept list = the Cloud SQL tenant project); it doesn't replace it.
+- **State addresses:** `moved` blocks map the DMS profiles and the job to their new `[0]` addresses, and the attach and demote steps are updated in place, so nothing is replaced or re-run.
+- **Migration window:** Don't apply on a demoted destination before promotion (runbook section 6).
+
 ---
 
 ## 6. Testing, Support and License

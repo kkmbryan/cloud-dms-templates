@@ -14,6 +14,7 @@ This page records what has been tested, with which versions, and what is known n
 | Negative validation | `terraform plan` | `PHYSICAL` + `MYSQL_8_4`, `PHYSICAL` with a file path, `backup_gcs_path` with a trailing slash, source password longer than 32 characters | Rejected, as intended |
 | Shell lint | ShellCheck 0.10.0 | `templates/02-backup-migration-gcs-cdc/scripts/xtrabackup_to_gcs.sh`, `scripts/source-prep/preflight_check.sh` | Pass |
 | `ignore_changes` on `psc_config` | `terraform plan` (PR-3) | Template 01 with `network_attachment_uri` managed natively | A reference from the instance to the Network Attachment creates a dependency cycle (the `ACCEPT_MANUAL` attachment needs the instance first). With a literal URI after creation, the plan reported no changes. The templates keep `ignore_changes`. |
+| Upgrade from the PR-2 state | Terraform 1.11.4, the attach and demote `terraform_data` blocks with a stubbed `gcloud` | PR-2 state, then the PR-3 code | Plan: 2 in-place `input` updates, no replacement. `count` to 0 and a replacement on the old state run the destroy-time detach without errors. |
 
 ## 2. Live End-to-End Tests
 

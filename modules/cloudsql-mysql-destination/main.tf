@@ -99,7 +99,6 @@ resource "google_sql_database_instance" "destination" {
         complexity                  = password_validation_policy.value.complexity
         reuse_interval              = password_validation_policy.value.reuse_interval
         disallow_username_substring = password_validation_policy.value.disallow_username_substring
-        password_change_interval    = password_validation_policy.value.password_change_interval
       }
     }
 
@@ -169,8 +168,9 @@ resource "terraform_data" "psc_outbound_network_attachment" {
   # Network Attachment exists.
   count = var.enabled && var.connectivity_type == "PSC" && var.psc_outbound_enabled ? 1 : 0
 
+  # Keep this list unchanged across versions: changing it replaces the resource
+  # (detach + re-attach, i.e. two restarts) on existing stacks.
   triggers_replace = [
-    var.project_id,
     google_sql_database_instance.destination[0].name,
     local.psc_network_attachment_uri,
   ]
@@ -227,13 +227,15 @@ resource "terraform_data" "psc_outbound_network_attachment" {
     EOT
   }
 
+  # Destroy-time provisioners evaluate the OLD state: use try() for input keys
+  # that states written by earlier versions of this module don't have.
   provisioner "local-exec" {
     when        = destroy
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -euo pipefail
-      if [ -n "${self.input.impersonate_sa}" ]; then
-        export CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT="${self.input.impersonate_sa}"
+      if [ -n "${try(self.input.impersonate_sa, "")}" ]; then
+        export CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT="${try(self.input.impersonate_sa, "")}"
       fi
       PROJECT="${self.input.project_id}"
       INSTANCE="${self.input.instance_name}"
@@ -264,7 +266,7 @@ resource "terraform_data" "psc_outbound_network_attachment" {
         echo "ERROR: instances patch returned no operation name." >&2
         exit 1
       fi
-      gcloud sql operations wait "$${OP}" --project="$${PROJECT}" --timeout="${self.input.timeout_seconds}"
+      gcloud sql operations wait "$${OP}" --project="$${PROJECT}" --timeout="${try(self.input.timeout_seconds, 1800)}"
 
       AFTER=$(gcloud sql instances describe "$${INSTANCE}" --project="$${PROJECT}" \
         --format="value(settings.ipConfiguration.pscConfig.networkAttachmentUri)")

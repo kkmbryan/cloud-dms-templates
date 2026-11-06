@@ -173,7 +173,7 @@ Sources: [Backend type: gcs](https://developer.hashicorp.com/terraform/language/
 
 | Variable | Resource | Notes |
 | :--- | :--- | :--- |
-| `cloudsql_kms_key_name` | Cloud SQL instance `encryption_key_name` | Set only when the instance is created; you can't add, remove or change it later. The key must be in the same region as the instance (`europe-west2`). In `DMS_MANAGED_CLOUDSQL` mode, DMS creates the instance; check that your DMS destination settings support CMEK. |
+| `cloudsql_kms_key_name` | Cloud SQL instance `encryption_key_name` | Set only when the instance is created; you can't add, remove or change it later. The key must be in the same region as the instance (`europe-west2`). In `DMS_MANAGED_CLOUDSQL` mode, the same key is passed to the DMS destination profile (`cloudsql.settings.cmek_key_name`) for the instance that DMS creates. |
 | `staging_bucket_kms_key_name` | Scenario 2 staging bucket default key | New seed objects are encrypted with the key. Use a key in the bucket location. |
 
 Key format: `projects/my-gcp-project-01/locations/europe-west2/keyRings/KEY_RING/cryptoKeys/KEY_NAME`.
@@ -343,7 +343,7 @@ rm -f tfplan
 > [!WARNING]
 > Clearing the Network Attachment from the instance **restarts the Cloud SQL instance**. Apply `migration_enabled = false` in a maintenance window.
 
-In a live test, `migration_enabled = false` removed 7 resources in about 6 minutes (the detach took about 5 minutes). A client probe through the PSC endpoint failed for about 20 seconds during the restart. The instance's allowed PSC consumer projects were unchanged after the detach, and the next `terraform plan` reported no changes.
+In a live test, `migration_enabled = false` removed 7 resources in about 6 minutes (the detach took about 5 minutes). A client probe through the PSC endpoint failed for about 20 seconds during the restart (observed; the Cloud SQL documentation gives about 8 minutes for the operation and about 3 minutes of downtime, see [Configure Private Service Connect](https://cloud.google.com/sql/docs/mysql/configure-private-service-connect)). The instance's allowed PSC consumer projects were unchanged after the detach, and the next `terraform plan` reported no changes.
 
 Then remove the remaining migration data:
 

@@ -173,7 +173,7 @@ mysql --ssl-mode=VERIFY_IDENTITY --ssl-ca=server-ca.pem \
 
 | 变量 | 资源 | 说明 |
 | :--- | :--- | :--- |
-| `cloudsql_kms_key_name` | Cloud SQL 实例的 `encryption_key_name` | 只能在创建实例时设置；之后无法添加、移除或更改。密钥必须与实例位于同一区域（`europe-west2`）。在 `DMS_MANAGED_CLOUDSQL` 模式下由 DMS 创建实例；请确认您的 DMS 目标设置支持 CMEK。 |
+| `cloudsql_kms_key_name` | Cloud SQL 实例的 `encryption_key_name` | 只能在创建实例时设置；之后无法添加、移除或更改。密钥必须与实例位于同一区域（`europe-west2`）。在 `DMS_MANAGED_CLOUDSQL` 模式下，同一密钥会传给 DMS 目标连接配置文件（`cloudsql.settings.cmek_key_name`），用于 DMS 创建的实例。 |
 | `staging_bucket_kms_key_name` | 场景 2 暂存存储桶的默认密钥 | 新的种子对象会使用该密钥加密。请使用与存储桶位置一致的密钥。 |
 
 密钥格式：`projects/my-gcp-project-01/locations/europe-west2/keyRings/KEY_RING/cryptoKeys/KEY_NAME`。
@@ -343,7 +343,7 @@ rm -f tfplan
 > [!WARNING]
 > 从实例上清除 Network Attachment 会**重启 Cloud SQL 实例**。请在维护窗口内应用 `migration_enabled = false`。
 
-在在线测试中，`migration_enabled = false` 在约 6 分钟内移除了 7 个资源（分离约耗时 5 分钟）。在重启期间，通过 PSC 端点进行的客户端探测失败了约 20 秒。分离后，实例允许的 PSC 使用方项目保持不变，下一次 `terraform plan` 显示没有更改。
+在在线测试中，`migration_enabled = false` 在约 6 分钟内移除了 7 个资源（分离约耗时 5 分钟）。在重启期间，通过 PSC 端点进行的客户端探测失败了约 20 秒（观察结果；Cloud SQL 文档给出的数据是操作约 8 分钟、停机约 3 分钟，请参阅[配置 Private Service Connect](https://cloud.google.com/sql/docs/mysql/configure-private-service-connect)）。分离后，实例允许的 PSC 使用方项目保持不变，下一次 `terraform plan` 显示没有更改。
 
 然后删除剩余的迁移数据：
 

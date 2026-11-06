@@ -513,7 +513,7 @@ flowchart LR
   F --> G
 ```
 
-1. **安排维护窗口。** 分离 Network Attachment 会**重启实例**。在测试中，分离操作约耗时 5 分钟，通过 PSC 端点连接的客户端在重启期间出现了短暂中断。
+1. **安排维护窗口。** 分离 Network Attachment 会**重启实例**。Cloud SQL 文档给出的数据是：启用或更改 PSC 出站连接时，操作约需 8 分钟，停机约 3 分钟（[配置 Private Service Connect](https://cloud.google.com/sql/docs/mysql/configure-private-service-connect)）；请按这些数据规划。测试中的观察结果：分离约耗时 5 分钟，通过 PSC 端点进行的客户端探测失败了约 20 秒。
 2. **检查计划。** 计划只能销毁 DMS 作业、连接配置文件、降级步骤、挂接步骤、Network Attachment 和源端防火墙规则，不得涉及 Cloud SQL 实例、root 用户、PSC 端点或 DNS 记录：
    ```bash
    terraform plan -var migration_enabled=false -out=tfplan
@@ -532,6 +532,8 @@ flowchart LR
 5. **场景 2：** 删除初始数据（`gcloud storage rm`，对于 `PHYSICAL` 文件夹请添加 `--recursive`）。非当前版本会在 `staging_bucket_noncurrent_version_retention_days` 天后删除。不再需要该存储桶时将其移除。
 6. **可选：将实例迁入长期栈。** 先备份状态，从迁移栈中移除实例和 PSC 端点，再将它们导入一个保持 `deletion_protection` 开启的栈（使用 `import` 块）：
    ```bash
-   terraform state pull > pre-decommission.tfstate
+   (umask 077; terraform state pull > pre-decommission.tfstate)   # contains secrets: mode 0600
    terraform state rm module.cloudsql_destination module.cloudsql_psc_endpoint
+   # After the import into the long-lived stack succeeds:
+   shred -u pre-decommission.tfstate
    ```

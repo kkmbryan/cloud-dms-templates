@@ -216,13 +216,12 @@ variable "kms_key_name" {
 }
 
 variable "password_validation_policy" {
-  description = "Optional password validation policy for database users (null disables it). Enable it on an existing instance (for example after promotion): at creation the API checks the root password, which google_sql_user sets only afterwards, and rejects the instance. complexity: COMPLEXITY_DEFAULT or COMPLEXITY_UNSPECIFIED; password_change_interval: for example \"2592000s\"."
+  description = "Optional password validation policy for database users (null disables it). Enable it on an existing instance (for example after promotion): at creation the API checks the root password, which google_sql_user sets only afterwards, and rejects the instance. complexity: COMPLEXITY_DEFAULT or COMPLEXITY_UNSPECIFIED. (password_change_interval is not offered: Cloud SQL supports it only for PostgreSQL.)"
   type = object({
     min_length                  = optional(number, 12)
     complexity                  = optional(string, "COMPLEXITY_DEFAULT")
     reuse_interval              = optional(number, 5)
     disallow_username_substring = optional(bool, true)
-    password_change_interval    = optional(string)
   })
   default = null
 }

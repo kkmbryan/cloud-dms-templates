@@ -151,6 +151,7 @@ module "dms_connection_profiles" {
   dest_disk_size_gb     = var.cloudsql_disk_size_gb
   dest_zone             = var.cloudsql_zone != "" ? var.cloudsql_zone : "${var.region}-a"
   dest_root_password    = var.cloudsql_root_password
+  dest_cmek_key_name    = var.cloudsql_kms_key_name
   dest_enable_ipv4      = false
   dest_private_network  = var.network
   labels                = var.labels

@@ -14,6 +14,7 @@
 | 负面验证 | `terraform plan` | `PHYSICAL` + `MYSQL_8_4`、`PHYSICAL` 使用文件路径、`backup_gcs_path` 带结尾斜杠、源密码超过 32 个字符 | 按预期被拒绝 |
 | Shell 检查 | ShellCheck 0.10.0 | `templates/02-backup-migration-gcs-cdc/scripts/xtrabackup_to_gcs.sh`、`scripts/source-prep/preflight_check.sh` | 通过 |
 | `psc_config` 上的 `ignore_changes` | `terraform plan`（PR-3） | 模板 01，以原生方式管理 `network_attachment_uri` | 从实例引用 Network Attachment 会产生依赖循环（`ACCEPT_MANUAL` 挂接需要先有实例）。创建后使用字面 URI 时，plan 显示没有更改。模板保留 `ignore_changes`。 |
+| 从 PR-2 状态升级 | Terraform 1.11.4，使用挂接和降级 `terraform_data` 块，`gcloud` 为桩程序 | PR-2 状态，然后使用 PR-3 代码 | plan：2 处原地更新 `input`，无替换。在旧状态上将 `count` 设为 0 或进行替换时，销毁时的分离步骤运行无错误。 |
 
 ## 2. 端到端在线测试
 

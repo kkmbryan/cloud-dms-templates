@@ -513,7 +513,7 @@ flowchart LR
   F --> G
 ```
 
-1. **Schedule a maintenance window.** Detaching the Network Attachment **restarts the instance**. In testing, the detach operation took about 5 minutes, and clients that connect through the PSC endpoint saw a short outage during the restart.
+1. **Schedule a maintenance window.** Detaching the Network Attachment **restarts the instance**. The Cloud SQL documentation gives about 8 minutes for the operation and about 3 minutes of downtime when PSC outbound connectivity is enabled or changed ([Configure Private Service Connect](https://cloud.google.com/sql/docs/mysql/configure-private-service-connect)); plan for those figures. Observed in testing: the detach took about 5 minutes, and a client probe through the PSC endpoint failed for about 20 seconds.
 2. **Review the plan.** It must destroy only the DMS job, the connection profiles, the demote step, the attach step, the Network Attachment and the source firewall rule, and must not touch the Cloud SQL instance, the root user, the PSC endpoint or the DNS record:
    ```bash
    terraform plan -var migration_enabled=false -out=tfplan
@@ -532,6 +532,8 @@ flowchart LR
 5. **Scenario 2:** delete the seed (`gcloud storage rm`, add `--recursive` for a `PHYSICAL` folder). The noncurrent version is deleted after `staging_bucket_noncurrent_version_retention_days`. Remove the bucket when you no longer need it.
 6. **Optional: move the instance to a long-lived stack.** Back up the state, remove the instance and the PSC endpoint from the migration stack, and import them into a stack that keeps `deletion_protection` on (`import` blocks):
    ```bash
-   terraform state pull > pre-decommission.tfstate
+   (umask 077; terraform state pull > pre-decommission.tfstate)   # contains secrets: mode 0600
    terraform state rm module.cloudsql_destination module.cloudsql_psc_endpoint
+   # After the import into the long-lived stack succeeds:
+   shred -u pre-decommission.tfstate
    ```

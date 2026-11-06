@@ -107,6 +107,7 @@ resource "google_database_migration_service_connection_profile" "destination" {
       auto_storage_increase = var.dest_auto_storage_increase
       zone                  = var.dest_zone
       root_password         = var.dest_root_password
+      cmek_key_name         = var.dest_cmek_key_name
       user_labels           = var.labels
 
       ip_config {

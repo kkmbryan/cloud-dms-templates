@@ -244,6 +244,16 @@ make promote-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-liv
 
 提升之前，请完成运维手册第 8 节中的 Go / No-Go 检查清单和回退决策。提升之后，应用连接到 `terraform output -raw psc_endpoint_dns_name`（即实例 DNS 名称，由私有区域解析为 PSC 端点 IP），并使用 TLS；然后运行 `terraform plan`/`apply`（运维手册第 9.1 节）。如需下线迁移对象并保留 Cloud SQL，请设置 `migration_enabled = false` 并执行 apply（运维手册第 10.2 节；分离 Network Attachment 会重启实例）。
 
+
+### 从早期版本升级
+
+对使用早期版本模板创建的栈执行 apply 之前，请先检查 `terraform plan`：
+
+- **防火墙规则：** `create_source_firewall_rule = true` 为默认值，需要设置 `source_target_tags` 或 `source_target_service_accounts`，否则 plan 会因前置条件失败。如果您已自行管理等效规则，请设置 `create_source_firewall_rule = false`。
+- **Network Attachment：** `psc_connection_preference` 现在默认为 `ACCEPT_MANUAL`，并已移除 `dms_tenant_project_id`。plan 会原地更新现有挂接（接受列表 = Cloud SQL 租户项目），不会替换它。
+- **状态地址：** `moved` 块会把 DMS 连接配置文件和作业映射到新的 `[0]` 地址，挂接和降级步骤会原地更新，因此不会替换或重新运行任何资源。
+- **迁移窗口：** 提升之前，不要对已降级的目标实例执行 apply（运维手册第 6 节）。
+
 ---
 
 ## 6. 测试、支持与许可

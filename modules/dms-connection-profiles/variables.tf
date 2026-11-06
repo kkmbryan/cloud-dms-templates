@@ -160,6 +160,12 @@ variable "dest_root_password" {
   sensitive   = true
 }
 
+variable "dest_cmek_key_name" {
+  description = "Optional Cloud KMS key (CMEK) for the instance that DMS creates when destination_mode is DMS_MANAGED_CLOUDSQL."
+  type        = string
+  default     = null
+}
+
 variable "dest_enable_ipv4" {
   description = "Whether public IPv4 is enabled when destination_mode is DMS_MANAGED_CLOUDSQL."
   type        = bool

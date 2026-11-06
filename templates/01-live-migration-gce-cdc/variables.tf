@@ -26,9 +26,14 @@ variable "network" {
 }
 
 variable "subnet" {
-  description = "Self-link or URI of the regional subnetwork used by the PSC Network Attachment (required when connectivity_type = 'PSC')."
+  description = "Full path (projects/PROJECT/regions/REGION/subnetworks/SUBNET) or self-link of the regional subnetwork used by the PSC Network Attachment (required when connectivity_type = 'PSC')."
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.subnet == "" || can(regex("^(https://www\\.googleapis\\.com/compute/v1/)?projects/[^/]+/regions/[^/]+/subnetworks/[^/]+$", var.subnet))
+    error_message = "subnet must be empty or a full subnetwork path: projects/PROJECT/regions/REGION/subnetworks/SUBNET (optionally prefixed with https://www.googleapis.com/compute/v1/)."
+  }
 }
 
 variable "network_attachment_name" {
@@ -38,9 +43,14 @@ variable "network_attachment_name" {
 }
 
 variable "network_attachment_subnet" {
-  description = "Optional dedicated subnet (self-link or ID) for the PSC Network Attachment, for example a /28 used only by the attachment. The firewall rule trusts this subnet's CIDR. Defaults to var.subnet when empty."
+  description = "Optional dedicated subnet for the PSC Network Attachment, as a full path (projects/PROJECT/regions/REGION/subnetworks/SUBNET) or self-link, for example a /28 used only by the attachment. The firewall rule trusts this subnet's CIDR. Defaults to var.subnet when empty."
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.network_attachment_subnet == "" || can(regex("^(https://www\\.googleapis\\.com/compute/v1/)?projects/[^/]+/regions/[^/]+/subnetworks/[^/]+$", var.network_attachment_subnet))
+    error_message = "network_attachment_subnet must be empty or a full subnetwork path: projects/PROJECT/regions/REGION/subnetworks/SUBNET (optionally prefixed with https://www.googleapis.com/compute/v1/)."
+  }
 }
 
 variable "psc_connection_preference" {
@@ -336,19 +346,18 @@ variable "cloudsql_ssl_mode" {
 }
 
 variable "cloudsql_kms_key_name" {
-  description = "Optional Cloud KMS key for CMEK on the Cloud SQL instance (projects/P/locations/REGION/keyRings/R/cryptoKeys/K, same region). Set at creation only. Grant the Cloud SQL service agent roles/cloudkms.cryptoKeyEncrypterDecrypter first."
+  description = "Optional Cloud KMS key for CMEK on the Cloud SQL instance (projects/P/locations/REGION/keyRings/R/cryptoKeys/K, same region). Set at creation only. Grant the Cloud SQL service agent roles/cloudkms.cryptoKeyEncrypterDecrypter first. Also used for the DMS-created instance in DMS_MANAGED_CLOUDSQL mode (cloudsql.settings.cmek_key_name)."
   type        = string
   default     = null
 }
 
 variable "cloudsql_password_validation_policy" {
-  description = "Optional Cloud SQL password validation policy for database users (null = off). Enable it after promotion (post-promotion apply): when it is set at creation, the API rejects the instance because the root password is applied afterwards (write-only google_sql_user). Example: { min_length = 14, complexity = \"COMPLEXITY_DEFAULT\", reuse_interval = 5, disallow_username_substring = true }."
+  description = "Optional Cloud SQL password validation policy for database users (null = off). Enable it after promotion (post-promotion apply): when it is set at creation, the API rejects the instance because the root password is applied afterwards (write-only google_sql_user). Example: { min_length = 14, complexity = \"COMPLEXITY_DEFAULT\", reuse_interval = 5, disallow_username_substring = true }. password_change_interval is not offered (PostgreSQL only)."
   type = object({
     min_length                  = optional(number, 12)
     complexity                  = optional(string, "COMPLEXITY_DEFAULT")
     reuse_interval              = optional(number, 5)
     disallow_username_substring = optional(bool, true)
-    password_change_interval    = optional(string)
   })
   default = null
 }
