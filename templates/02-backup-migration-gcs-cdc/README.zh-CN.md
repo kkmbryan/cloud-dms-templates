@@ -19,28 +19,28 @@
 ```mermaid
 flowchart LR
     subgraph GCE_VPC["生产 VPC"]
-        GCE["GCE 虚拟机：自管理 MySQL 8.0\n(GTID=ON, ROW Binlog)"]
-        NA["PSC Network Attachment\n(dms-mysql-psc-na)"]
+        GCE["GCE 虚拟机：自管理 MySQL 8.0<br/>(GTID=ON, ROW Binlog)"]
+        NA["PSC Network Attachment<br/>(dms-mysql-psc-na)"]
     end
 
     subgraph GCS_Stage["区域级 Cloud Storage"]
-        GCS["GCS 暂存存储桶\n(Percona XtraBackup PHYSICAL\n或 mysqldump LOGICAL)"]
+        GCS["GCS 暂存存储桶<br/>(Percona XtraBackup PHYSICAL<br/>或 mysqldump LOGICAL)"]
     end
 
     subgraph DMS_Control["Google Cloud DMS"]
-        JOB["DMS 迁移作业\n(CONTINUOUS：GCS dump_path + CDC\n+ demote-destination)"]
+        JOB["DMS 迁移作业<br/>(CONTINUOUS：GCS dump_path + CDC<br/>+ demote-destination)"]
     end
 
     subgraph CloudSQL_Producer["Cloud SQL 提供方 VPC"]
-        CSQL["Cloud SQL for MySQL 8.4 / 8.0\n(纯 PSC + network_attachment_uri)"]
+        CSQL["Cloud SQL for MySQL 8.4 / 8.0<br/>(纯 PSC + network_attachment_uri)"]
     end
 
-    GCE -->|1. 流式传输非阻塞备份\nstream_xtrabackup_to_gcs.sh| GCS
-    GCS -->|2. 恢复初始数据\n(dump_path)| CSQL
-    CSQL -->|PSC 出站：network_attachment_uri| NA
-    NA -->|内部路由（端口 3306）| GCE
-    GCE -->|3. 基于 GTID 的持续 Binlog CDC| CSQL
-    JOB -->|编排数据填充、降级与 CDC| CSQL
+    GCE -->|"步骤 1：流式传输非阻塞备份<br/>stream_xtrabackup_to_gcs.sh"| GCS
+    GCS -->|"步骤 2：恢复初始数据<br/>(dump_path)"| CSQL
+    CSQL -->|"PSC 出站：network_attachment_uri"| NA
+    NA -->|"内部路由（端口 3306）"| GCE
+    GCE -->|"步骤 3：基于 GTID 的持续 Binlog CDC"| CSQL
+    JOB -->|"编排数据填充、降级与 CDC"| CSQL
 ```
 
 ---

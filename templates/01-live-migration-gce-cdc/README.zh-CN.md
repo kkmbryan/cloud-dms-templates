@@ -19,22 +19,22 @@
 ```mermaid
 flowchart LR
     subgraph GCE_VPC["生产 VPC"]
-        GCE["GCE 虚拟机：自管理 MySQL 8.0\n(GTID=ON, ROW Binlog)"]
-        NA["PSC Network Attachment\n(dms-mysql-psc-na)"]
+        GCE["GCE 虚拟机：自管理 MySQL 8.0<br/>(GTID=ON, ROW Binlog)"]
+        NA["PSC Network Attachment<br/>(dms-mysql-psc-na)"]
     end
 
     subgraph DMS_Control["Google Cloud DMS"]
-        JOB["DMS 迁移作业\n(CONTINUOUS：MAX 并行转储 + CDC\n+ demote-destination)"]
+        JOB["DMS 迁移作业<br/>(CONTINUOUS：MAX 并行转储 + CDC<br/>+ demote-destination)"]
     end
 
     subgraph CloudSQL_Producer["Cloud SQL 提供方 VPC"]
-        CSQL["Cloud SQL for MySQL 8.4 / 8.0\n(纯 PSC + network_attachment_uri)"]
+        CSQL["Cloud SQL for MySQL 8.4 / 8.0<br/>(纯 PSC + network_attachment_uri)"]
     end
 
-    CSQL -->|PSC 出站：network_attachment_uri| NA
-    NA -->|内部路由（端口 3306）| GCE
-    GCE -->|1. 并行逻辑转储\n2. 持续 Binlog CDC| CSQL
-    JOB -->|编排转储、降级与 CDC| CSQL
+    CSQL -->|"PSC 出站：network_attachment_uri"| NA
+    NA -->|"内部路由（端口 3306）"| GCE
+    GCE -->|"步骤 1：并行逻辑转储<br/>步骤 2：持续 Binlog CDC"| CSQL
+    JOB -->|"编排转储、降级与 CDC"| CSQL
 ```
 
 ---
