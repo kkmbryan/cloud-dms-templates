@@ -8,12 +8,12 @@
 #   https://cloud.google.com/database-migration/docs/mysql/migrate-with-physical-xtrabackup
 #
 # Steps: prechecks -> xtrabackup --backup -> (--decompress) -> --prepare ->
-#        gcloud storage cp -r <prepared files> gs://<bucket>/<folder>/
+#        gcloud storage rsync --recursive <prepared dir> gs://<bucket>/<folder>
 #
 # PHYSICAL seeds are supported only for a MYSQL_8_0 Cloud SQL target.
 #
 # Run it on the source VM as an OS user that can read the MySQL datadir.
-# The VM's gcloud identity needs roles/storage.objectCreator on the bucket
+# The VM's gcloud identity needs roles/storage.objectCreator + objectViewer on the bucket
 # (Terraform variable backup_writer_members).
 #
 # Usage:
@@ -142,8 +142,17 @@ log "MySQL server version: ${SERVER_VERSION}; xtrabackup version: ${XB_VERSION}"
 [[ "${SERVER_VERSION%%.*}.$(cut -d. -f2 <<<"${SERVER_VERSION}")" == "8.0" ]] ||
   die "This script supports MySQL 8.0 sources only (DMS PHYSICAL seeds target MYSQL_8_0). Server is ${SERVER_VERSION}."
 lowest="$(printf '%s\n%s\n' "${SERVER_VERSION}" "${XB_VERSION}" | sort -V | head -n1)"
+XB_EXTRA_ARGS=()
 if [[ "${lowest}" != "${SERVER_VERSION}" ]]; then
-  die "xtrabackup ${XB_VERSION} is older than the server ${SERVER_VERSION}. Install Percona XtraBackup ${SERVER_VERSION} or later."
+  # DMS asks for an XtraBackup version equal to or later than the server.
+  # Percona XtraBackup 8.0.34+ can also back up newer 8.0 servers when
+  # --lock-ddl=ON is used:
+  # https://docs.percona.com/percona-xtrabackup/8.0/server-backup-version-comparison.html
+  xb_floor="$(printf '%s\n%s\n' "8.0.34" "${XB_VERSION}" | sort -V | head -n1)"
+  [[ "${xb_floor}" == "8.0.34" ]] ||
+    die "xtrabackup ${XB_VERSION} is older than the server ${SERVER_VERSION}. Install Percona XtraBackup ${SERVER_VERSION} or later (8.0.34+ at minimum)."
+  warn "xtrabackup ${XB_VERSION} is older than the server ${SERVER_VERSION}. Continuing with --lock-ddl=ON (supported by XtraBackup 8.0.34+). Prefer an XtraBackup release >= the server version when one is available."
+  XB_EXTRA_ARGS+=(--lock-ddl=ON)
 fi
 
 PAGE_SIZE="$(mysql_q 'SELECT @@innodb_page_size;')"
@@ -170,7 +179,7 @@ if ls_out="$(gcloud storage ls "${GCS_BACKUP_FOLDER}/**" 2>&1)"; then
 elif grep -q "matched no objects" <<<"${ls_out}"; then
   log "Target folder ${GCS_BACKUP_FOLDER} is empty."
 else
-  warn "Could not list ${GCS_BACKUP_FOLDER} (objectCreator cannot list). Make sure the folder is new and empty."
+  warn "Could not list ${GCS_BACKUP_FOLDER} (missing roles/storage.objectViewer?). Make sure the folder is new and empty."
 fi
 
 # ------------------------------------------------------------------------------
@@ -184,6 +193,7 @@ mkdir -p "${TARGET_DIR}"
 log "Backing up ${MYSQL_DATADIR} to ${TARGET_DIR} (log: ${LOG_FILE})..."
 BACKUP_ARGS=(--backup --target-dir="${TARGET_DIR}" --datadir="${MYSQL_DATADIR}" --parallel="${PARALLEL_THREADS}")
 [[ "${XTRABACKUP_COMPRESS}" == "true" ]] && BACKUP_ARGS+=(--compress)
+BACKUP_ARGS+=(${XB_EXTRA_ARGS[@]+"${XB_EXTRA_ARGS[@]}"})
 xtrabackup --defaults-extra-file="${CNF}" ${CONN_ARGS[@]+"${CONN_ARGS[@]}"} "${BACKUP_ARGS[@]}" 2>>"${LOG_FILE}" ||
   die "xtrabackup --backup failed. See ${LOG_FILE}."
 tail -n 5 "${LOG_FILE}" | grep -q "completed OK!" || die "xtrabackup --backup did not report 'completed OK!'. See ${LOG_FILE}."
@@ -212,9 +222,9 @@ big_files="$(find "${TARGET_DIR}" -type f -size +"${GCS_MAX_OBJECT_BYTES}"c)"
 # ------------------------------------------------------------------------------
 LOCAL_COUNT="$(find "${TARGET_DIR}" -type f | wc -l)"
 log "Uploading ${LOCAL_COUNT} files to ${GCS_BACKUP_FOLDER}/ ..."
-shopt -s dotglob nullglob
-gcloud storage cp -r "${TARGET_DIR}"/* "${GCS_BACKUP_FOLDER}/"
-shopt -u dotglob nullglob
+# rsync copies the folder contents (not the folder itself) and skips empty
+# directories such as #innodb_redo, which is empty after --prepare.
+gcloud storage rsync --recursive "${TARGET_DIR}" "${GCS_BACKUP_FOLDER}"
 
 if REMOTE_LIST="$(gcloud storage ls "${GCS_BACKUP_FOLDER}/**" 2>/dev/null)"; then
   REMOTE_COUNT="$(grep -c -v '/$' <<<"${REMOTE_LIST}" || true)"
@@ -222,7 +232,7 @@ if REMOTE_LIST="$(gcloud storage ls "${GCS_BACKUP_FOLDER}/**" 2>/dev/null)"; the
     die "Upload check failed: ${LOCAL_COUNT} local files, ${REMOTE_COUNT} objects in ${GCS_BACKUP_FOLDER}."
   log "Upload verified: ${REMOTE_COUNT} objects."
 else
-  warn "Could not list ${GCS_BACKUP_FOLDER} to verify the upload (objectCreator cannot list). Check it with a reader account."
+  warn "Could not list ${GCS_BACKUP_FOLDER} to verify the upload (missing roles/storage.objectViewer?). Check it with a reader account."
 fi
 
 if [[ "${KEEP_LOCAL_BACKUP}" == "false" ]]; then

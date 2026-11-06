@@ -10,7 +10,7 @@ This root Terraform template deploys a **Backup-Seeded Continuous Change Data Ca
 
 - **You Control the Initial Seed**: Instead of a DMS-managed dump, you create a **`mysqldump` file (`LOGICAL`, default)** or a **prepared Percona XtraBackup (`PHYSICAL`)** on your own schedule and upload it to a regional **Cloud Storage (GCS)** staging bucket.
 - **Seed + Automatic GTID CDC Resumption**: DMS restores the seed from `dump_path`, reads the GTID position recorded in the backup, and then replicates ongoing **binlog CDC** changes from the live source until cutover.
-- **Automatic Bucket IAM**: The DMS service agent and the Cloud SQL instance service account get `roles/storage.objectViewer` + `roles/storage.legacyBucketReader`; `backup_writer_members` get `roles/storage.objectCreator`. You don't type the service agent email. In `DMS_MANAGED_CLOUDSQL` mode, DMS creates the instance after apply, so grant its service account both reader roles yourself before `verify`: `gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer` (repeat with `roles/storage.legacyBucketReader`).
+- **Automatic Bucket IAM**: The DMS service agent and the Cloud SQL instance service account get `roles/storage.objectViewer` + `roles/storage.legacyBucketReader`; `backup_writer_members` get `roles/storage.objectCreator` + `roles/storage.objectViewer`. You don't type the service agent email. In `DMS_MANAGED_CLOUDSQL` mode, DMS creates the instance after apply, so grant its service account both reader roles yourself before `verify`: `gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer` (repeat with `roles/storage.legacyBucketReader`).
 - **Strict Terraform Schema Compliance (`dump_path` vs. `dump_flags`)**: Enforces the Google Terraform Provider requirement that `dump_path` and `dump_flags` are mutually exclusive on `google_database_migration_service_migration_job`.
 
 ### Support Matrix
@@ -57,7 +57,7 @@ flowchart LR
 
 ## Usage Instructions
 
-Complete the [Prerequisites](../../README.md#3-prerequisites) (including `gcloud beta services identity create --service=datamigration.googleapis.com`) and the source preparation in [runbook section 2](../../docs/gce_mysql80_to_cloudsql_dms_migration_runbook.md) first. The order is: **apply → produce the seed → verify → start**.
+Complete the [Prerequisites](../../README.md#3-prerequisites) (including `gcloud beta services identity create --service=datamigration.googleapis.com`) and the source preparation in [runbook section 2](../../docs/gce_mysql80_to_cloudsql_dms_migration_runbook.md) first (`make preflight` must report no FAIL). The order is: **apply with `create_migration_job = false` → produce the seed → apply again (creates the job) → users, grants, DEFINERs and flags (runbook section 5) → verify → start**. Scenario 2 needs two applies because DMS rejects job creation with "The supplied dump file doesn't exist" until the seed is at `dump_path`.
 
 ### 1. Configure Variables
 
@@ -74,7 +74,8 @@ export TF_VAR_source_gce_mysql_password='REPLACE_ME_MAX_32_CHARS'
 ```bash
 terraform init
 terraform validate
-terraform plan -out=tfplan
+# Phase 1: everything except the migration job (DMS checks dump_path when the job is created)
+terraform plan -var create_migration_job=false -out=tfplan
 terraform apply tfplan
 
 # The single seed location configured on the migration job
@@ -103,7 +104,13 @@ sudo -E ./scripts/xtrabackup_to_gcs.sh
 
 ### 4. Verify & Start the DMS Backup + CDC Migration Job
 
+Create the job with a second apply once the seed is complete, then complete runbook section 5. Don't run `terraform apply` between `start` and `promote`: DMS changes the destination's backup and recovery settings (runbook section 6).
+
 ```bash
+# Phase 2 (after the seed is complete): create the migration job and demote the destination
+terraform plan -out=tfplan
+terraform apply tfplan
+
 # Verify connection profiles, GCS permissions, and GTID replication topology
 gcloud database-migration migration-jobs verify gcs-bkp-mysql80-cdc \
   --region=europe-west2
@@ -115,11 +122,11 @@ gcloud database-migration migration-jobs start gcs-bkp-mysql80-cdc \
 
 ### 5. Cutover / Promotion
 
-Monitor `datamigration.googleapis.com/migration_job/max_replica_sec_lag` in Cloud Monitoring. When the lag is near `0` during the scheduled maintenance window, stop application writes to the source MySQL 8.0 and promote Cloud SQL:
+Monitor replication lag with `make lag` (`max_replica_sec_lag`, with a fallback to the destination's `replica_lag` when `CLOUDSQL_INSTANCE` is set) or in Cloud Monitoring. When the lag is near `0` during the scheduled maintenance window, stop application writes to the source MySQL 8.0, complete the Go / No-Go checklist and rollback decision (runbook section 8), and promote Cloud SQL:
 
 ```bash
 gcloud database-migration migration-jobs promote gcs-bkp-mysql80-cdc \
   --region=europe-west2
 ```
 
-Then point applications to the `psc_endpoint_dns_name` Terraform output.
+Then point applications to the `psc_endpoint_dns_name` Terraform output, and run `terraform plan`/`apply` (runbook section 9.1). For teardown and decommission (delete the staging bucket last), see runbook section 10.

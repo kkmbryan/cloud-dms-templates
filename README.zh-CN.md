@@ -52,6 +52,8 @@ flowchart LR
 
 ## 2. 迁移场景
 
+如需选择场景，请使用[运维手册第 1 节](docs/gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md)中的决策矩阵。如果目标为 8.4，另请阅读运维手册第 1.2 节中的 8.0 → 8.4 注意事项。
+
 ### 场景 1：从 Compute Engine 上的 MySQL 8.0 在线迁移 + 持续 CDC（`templates/01-live-migration-gce-cdc`）
 - **适用场景：** 源虚拟机能够承受由 DMS 管理的并行逻辑转储（默认 `dump_parallel_level = "OPTIMAL"`）的数据库。
 - **工作流程：**
@@ -64,7 +66,7 @@ flowchart LR
 - **支持的初始数据格式（`dump_type`）：**
   - **`LOGICAL`（默认 — `mysqldump`）：** 上传到暂存存储桶的单个压缩 mysqldump 文件。`dump_path` 指向该文件。适用于 `MYSQL_8_0` 和 `MYSQL_8_4` 目标。
   - **`PHYSICAL`（Percona XtraBackup）：** 经过**准备**（先 `xtrabackup --backup`，再 `--prepare`）并上传到存储桶中**专用文件夹**的完整备份。`dump_path` 指向该文件夹。**仅支持 `MYSQL_8_0` 目标。** 请使用 [`scripts/xtrabackup_to_gcs.sh`](templates/02-backup-migration-gcs-cdc/scripts/xtrabackup_to_gcs.sh)。
-- **自动配置存储桶 IAM：** Terraform 会在存储桶上为 DMS 服务代理和 Cloud SQL 实例服务账号授予 `roles/storage.objectViewer` 与 `roles/storage.legacyBucketReader`，并为 `backup_writer_members` 授予 `roles/storage.objectCreator`。 在 `DMS_MANAGED_CLOUDSQL` 模式下，实例由 DMS 在 apply 之后创建，因此请在 `verify` 之前自行为其服务账号授予这两个读取角色：`gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer`（再使用 `roles/storage.legacyBucketReader` 重复执行一次）。
+- **自动配置存储桶 IAM：** Terraform 会在存储桶上为 DMS 服务代理和 Cloud SQL 实例服务账号授予 `roles/storage.objectViewer` 与 `roles/storage.legacyBucketReader`，并为 `backup_writer_members` 授予 `roles/storage.objectCreator` + `roles/storage.objectViewer`。 在 `DMS_MANAGED_CLOUDSQL` 模式下，实例由 DMS 在 apply 之后创建，因此请在 `verify` 之前自行为其服务账号授予这两个读取角色：`gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer`（再使用 `roles/storage.legacyBucketReader` 重复执行一次）。
 - **Terraform Provider 互斥防护：** 在 `google_database_migration_service_migration_job` 中，`dump_path` 与 `dump_flags` 互斥。设置 `dump_path`（场景 2）时，`modules/dms-migration-job` 会省略 `dump_flags` 和 `performance_config`。
 
 ### 支持矩阵
@@ -88,7 +90,7 @@ flowchart LR
 | **API** | `datamigration`、`sqladmin`、`compute`、`servicenetworking`、`storage`、`dns`。 | 请参阅下方命令 |
 | **DMS 服务代理** | 必须在首次 apply 之前存在（场景 2 会为其授予存储桶访问权限）。 | 请参阅下方命令 |
 | **部署者角色** | 项目级的 `roles/datamigration.admin`、`roles/cloudsql.admin`、`roles/compute.networkAdmin`、`roles/dns.admin`、`roles/storage.admin`（场景 2）以及 `roles/serviceusage.serviceUsageConsumer`。 | `gcloud projects get-iam-policy PROJECT_ID` |
-| **源数据库** | [运维手册第 2 节](docs/gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md)中的 GTID 与 binlog 设置以及迁移账号。 | 运维手册 |
+| **源数据库** | [运维手册第 2 节](docs/gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md)中的 GTID 与 binlog 设置以及迁移账号，可使用 [`scripts/source-prep/`](scripts/source-prep/README.zh-CN.md) 完成准备。 | `make preflight`（在源虚拟机上） |
 
 ```bash
 export PROJECT_ID="my-gcp-project-01"
@@ -123,6 +125,14 @@ cloud-dms-templates/
 ├── docs/
 │   ├── gce_mysql80_to_cloudsql_dms_migration_runbook.md
 │   └── gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md
+├── scripts/
+│   └── source-prep/                      # Source MySQL 8.0 preparation (make preflight)
+│       ├── 01_mysqld_dms_source.cnf      # my.cnf drop-in: server_id, ROW binlog, GTID, retention
+│       ├── 02_enable_gtid_online.sql     # Step-by-step online GTID enablement
+│       ├── 03_create_dms_user.sql        # DMS and XtraBackup accounts, per-scenario grants
+│       ├── preflight_check.sh            # Read-only PASS/WARN/FAIL source check
+│       ├── README.md
+│       └── README.zh-CN.md
 ├── modules/
 │   ├── networking-psc/                   # PSC Network Attachment (or PSA peering)
 │   ├── gcs-migration-staging/            # Staging bucket + reader/writer IAM
@@ -147,7 +157,7 @@ cloud-dms-templates/
 
 ## 5. 快速入门与运维命令
 
-所有场景都遵循相同的顺序：**apply → 生成初始数据（仅场景 2）→ verify → start → promote**。
+所有场景都遵循相同的顺序：**预检 → apply → 生成初始数据并再次 apply（仅场景 2）→ 用户、授权、DEFINER 与参数 → verify → start → promote**。在 `start` 与 `promote` 之间不要运行 `terraform apply`（运维手册第 6 节）。
 
 ### 在本地验证所有模板
 ```bash
@@ -169,14 +179,15 @@ terraform apply tfplan
 
 ### 部署场景 2（从 Cloud Storage 填充初始数据 + CDC）
 ```bash
-# 1. Provision the bucket (with IAM), Cloud SQL, PSC endpoint, profiles and the job
+# 1. Phase 1: provision the bucket (with IAM), Cloud SQL, PSC endpoint and profiles.
+#    DMS checks dump_path when the job is created, so the job comes in phase 2.
 cd templates/02-backup-migration-gcs-cdc
 cp terraform.tfvars.example terraform.tfvars
 # Edit terraform.tfvars: dump_type and backup_gcs_path (see the support matrix)
 export TF_VAR_cloudsql_root_password='REPLACE_ME'
 export TF_VAR_source_gce_mysql_password='REPLACE_ME_MAX_32_CHARS'
 terraform init
-terraform plan -out=tfplan
+terraform plan -var create_migration_job=false -out=tfplan
 terraform apply tfplan
 
 # 2. The one seed location used everywhere
@@ -186,6 +197,10 @@ terraform output -raw configured_dump_path
 #    LOGICAL  -> mysqldump ... | gzip | gcloud storage cp - "<configured_dump_path>"
 #    PHYSICAL -> GCS_BACKUP_FOLDER="<configured_dump_path>" ./scripts/xtrabackup_to_gcs.sh
 #    (full commands: runbook section 4, Option B)
+
+# 4. Phase 2: create the migration job and demote the destination
+terraform plan -out=tfplan
+terraform apply tfplan
 ```
 
 ### 第 2 天：DMS 作业验证、监控与切换提升
@@ -198,14 +213,16 @@ make verify-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live
 make start-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
 
 # Monitor the job state and phase (FULL_DUMP -> CDC). Replication lag is in Cloud Monitoring:
-# datamigration.googleapis.com/migration_job/max_replica_sec_lag and max_replica_bytes_lag
+# datamigration.googleapis.com/migration_job/max_replica_sec_lag; make lag falls back to the
+# destination's cloudsql.googleapis.com/database/replication/replica_lag when CLOUDSQL_INSTANCE is set
 make status-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
+make lag PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc LAG_MINUTES=30 CLOUDSQL_INSTANCE=<cloudsql_instance_name>
 
 # Promote the Cloud SQL destination during the cutover window
 make promote-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
 ```
 
-提升之后，应用连接到 `terraform output -raw psc_endpoint_dns_name`（即实例 DNS 名称，由私有区域解析为 PSC 端点 IP）。
+提升之前，请完成运维手册第 8 节中的 Go / No-Go 检查清单和回退决策。提升之后，应用连接到 `terraform output -raw psc_endpoint_dns_name`（即实例 DNS 名称，由私有区域解析为 PSC 端点 IP）；然后运行 `terraform plan`/`apply`（运维手册第 9.1 节）。如需清理与下线，请参阅运维手册第 10 节。
 
 ---
 

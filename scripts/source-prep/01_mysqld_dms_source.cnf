@@ -1,0 +1,48 @@
+# ==============================================================================
+# MySQL 8.0 source settings for Database Migration Service (DMS) continuous
+# migrations (initial seed + GTID binlog CDC).
+# ==============================================================================
+# Install as a drop-in, for example:
+#   Debian/Ubuntu: /etc/mysql/mysql.conf.d/zz-dms-source.cnf
+#   RHEL/Oracle:   /etc/my.cnf.d/zz-dms-source.cnf
+# then restart mysqld during a maintenance window.
+#
+# If the server already runs with log_bin and gtid_mode=OFF and you can't
+# restart it, enable GTIDs online with 02_enable_gtid_online.sql first. That
+# script uses SET PERSIST, so the values below then only document the target
+# state (mysqld-auto.cnf takes precedence over my.cnf at startup).
+#
+# Verify with: ./preflight_check.sh (or `make preflight` from the repo root).
+# ==============================================================================
+
+[mysqld]
+# Unique, non-zero ID. Must differ from every other server in the replication
+# topology (including the Cloud SQL destination, which DMS manages).
+server_id                  = 1001
+
+# Binary log, row-based, full row images (required by DMS CDC).
+log_bin                    = mysql-bin
+binlog_format              = ROW
+binlog_row_image           = FULL
+
+# Listen address. Ubuntu/Debian packages ship bind-address = 127.0.0.1 in
+# mysqld.cnf, which blocks DMS. This file must sort after mysqld.cnf (hence the
+# "zz-" name) so that its value wins. 0.0.0.0 listens on all IPv4 addresses:
+# restrict TCP 3306 with VPC firewall rules to the PSC Network Attachment subnet
+# (and admin hosts). Alternatively, bind to the VM's private IP, e.g. 10.10.0.10.
+bind_address               = 0.0.0.0
+
+# GTID-based replication. DMS accepts only gtid_mode ON or OFF; the
+# intermediate OFF_PERMISSIVE / ON_PERMISSIVE states are rejected.
+gtid_mode                  = ON
+enforce_gtid_consistency   = ON
+
+# Binlog retention.
+#   retention >= total seed time (dump + upload + restore) + buffer
+#   with an absolute minimum of 7 days (604800 s).
+# DMS must still find every binlog event after the seed's GTID position when CDC
+# starts. If the binlogs are purged first, the job fails and you must re-seed.
+# Example: 30 h dump + 6 h upload + 40 h restore + 24 h buffer = 100 h,
+# which is below 7 days, so keep 604800. For a 10-day seed use, for example,
+# 1209600 (14 days). Check free disk space for the extra binlogs.
+binlog_expire_logs_seconds = 604800

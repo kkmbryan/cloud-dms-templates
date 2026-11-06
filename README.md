@@ -52,6 +52,8 @@ flowchart LR
 
 ## 2. Migration Scenarios
 
+To choose a scenario, use the decision matrix in [runbook section 1](docs/gce_mysql80_to_cloudsql_dms_migration_runbook.md#1-migration-decision-matrix-scenario-1-vs-scenario-2). For an 8.4 target, also read the 8.0 → 8.4 specifics in runbook section 1.2.
+
 ### Scenario 1: Live Migration from MySQL 8.0 on Compute Engine + Continuous CDC (`templates/01-live-migration-gce-cdc`)
 - **Best For:** Databases where the source VM can sustain a DMS-managed parallel logical dump (`dump_parallel_level = "OPTIMAL"` by default).
 - **Workflow:**
@@ -64,7 +66,7 @@ flowchart LR
 - **Supported Seed Formats (`dump_type`):**
   - **`LOGICAL` (Default — `mysqldump`):** One compressed mysqldump file uploaded to the staging bucket. `dump_path` points at the file. Works for `MYSQL_8_0` and `MYSQL_8_4` targets.
   - **`PHYSICAL` (Percona XtraBackup):** A full backup that is **prepared** (`xtrabackup --backup`, then `--prepare`) and uploaded to a **dedicated folder** in the bucket. `dump_path` points at the folder. **`MYSQL_8_0` target only.** Use [`scripts/xtrabackup_to_gcs.sh`](templates/02-backup-migration-gcs-cdc/scripts/xtrabackup_to_gcs.sh).
-- **Automatic bucket IAM:** Terraform grants `roles/storage.objectViewer` and `roles/storage.legacyBucketReader` on the bucket to the DMS service agent and to the Cloud SQL instance service account, and `roles/storage.objectCreator` to `backup_writer_members`. In `DMS_MANAGED_CLOUDSQL` mode, DMS creates the instance after apply, so grant its service account both reader roles yourself before `verify`: `gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer` (repeat with `roles/storage.legacyBucketReader`).
+- **Automatic bucket IAM:** Terraform grants `roles/storage.objectViewer` and `roles/storage.legacyBucketReader` on the bucket to the DMS service agent and to the Cloud SQL instance service account, and `roles/storage.objectCreator` + `roles/storage.objectViewer` to `backup_writer_members`. In `DMS_MANAGED_CLOUDSQL` mode, DMS creates the instance after apply, so grant its service account both reader roles yourself before `verify`: `gcloud storage buckets add-iam-policy-binding gs://BUCKET --member=serviceAccount:INSTANCE_SA --role=roles/storage.objectViewer` (repeat with `roles/storage.legacyBucketReader`).
 - **Terraform Provider Mutual Exclusivity Guardrail:** In `google_database_migration_service_migration_job`, `dump_path` and `dump_flags` are mutually exclusive. When `dump_path` is set (Scenario 2), `modules/dms-migration-job` omits `dump_flags` and `performance_config`.
 
 ### Support Matrix
@@ -88,7 +90,7 @@ Sources: [Migrate by using a Percona XtraBackup physical file](https://cloud.goo
 | **APIs** | `datamigration`, `sqladmin`, `compute`, `servicenetworking`, `storage`, `dns`. | See commands below |
 | **DMS service agent** | Must exist before the first apply (Scenario 2 grants it bucket access). | See commands below |
 | **Deployer roles** | `roles/datamigration.admin`, `roles/cloudsql.admin`, `roles/compute.networkAdmin`, `roles/dns.admin`, `roles/storage.admin` (Scenario 2), and `roles/serviceusage.serviceUsageConsumer` on the project. | `gcloud projects get-iam-policy PROJECT_ID` |
-| **Source database** | GTID and binlog settings and the migration accounts from [runbook section 2](docs/gce_mysql80_to_cloudsql_dms_migration_runbook.md#2-phase-1-source-mysql-80-pre-flight-verification). | Runbook |
+| **Source database** | GTID and binlog settings and the migration accounts from [runbook section 2](docs/gce_mysql80_to_cloudsql_dms_migration_runbook.md#2-phase-1-source-mysql-80-pre-flight-verification), prepared with [`scripts/source-prep/`](scripts/source-prep/README.md). | `make preflight` (on the source VM) |
 
 ```bash
 export PROJECT_ID="my-gcp-project-01"
@@ -123,6 +125,14 @@ cloud-dms-templates/
 ├── docs/
 │   ├── gce_mysql80_to_cloudsql_dms_migration_runbook.md
 │   └── gce_mysql80_to_cloudsql_dms_migration_runbook.zh-CN.md
+├── scripts/
+│   └── source-prep/                      # Source MySQL 8.0 preparation (make preflight)
+│       ├── 01_mysqld_dms_source.cnf      # my.cnf drop-in: server_id, ROW binlog, GTID, retention
+│       ├── 02_enable_gtid_online.sql     # Step-by-step online GTID enablement
+│       ├── 03_create_dms_user.sql        # DMS and XtraBackup accounts, per-scenario grants
+│       ├── preflight_check.sh            # Read-only PASS/WARN/FAIL source check
+│       ├── README.md
+│       └── README.zh-CN.md
 ├── modules/
 │   ├── networking-psc/                   # PSC Network Attachment (or PSA peering)
 │   ├── gcs-migration-staging/            # Staging bucket + reader/writer IAM
@@ -147,7 +157,7 @@ cloud-dms-templates/
 
 ## 5. Quick Start & Operational Commands
 
-Every scenario follows the same order: **apply → produce the seed (Scenario 2 only) → verify → start → promote**.
+Every scenario follows the same order: **preflight → apply → produce the seed and apply again (Scenario 2 only) → users, grants, DEFINERs and flags → verify → start → promote**. Don't run `terraform apply` between `start` and `promote` (runbook section 6).
 
 ### Validate All Templates Locally
 ```bash
@@ -169,14 +179,15 @@ terraform apply tfplan
 
 ### Deploy Scenario 2 (Seed from Cloud Storage + CDC)
 ```bash
-# 1. Provision the bucket (with IAM), Cloud SQL, PSC endpoint, profiles and the job
+# 1. Phase 1: provision the bucket (with IAM), Cloud SQL, PSC endpoint and profiles.
+#    DMS checks dump_path when the job is created, so the job comes in phase 2.
 cd templates/02-backup-migration-gcs-cdc
 cp terraform.tfvars.example terraform.tfvars
 # Edit terraform.tfvars: dump_type and backup_gcs_path (see the support matrix)
 export TF_VAR_cloudsql_root_password='REPLACE_ME'
 export TF_VAR_source_gce_mysql_password='REPLACE_ME_MAX_32_CHARS'
 terraform init
-terraform plan -out=tfplan
+terraform plan -var create_migration_job=false -out=tfplan
 terraform apply tfplan
 
 # 2. The one seed location used everywhere
@@ -186,6 +197,10 @@ terraform output -raw configured_dump_path
 #    LOGICAL  -> mysqldump ... | gzip | gcloud storage cp - "<configured_dump_path>"
 #    PHYSICAL -> GCS_BACKUP_FOLDER="<configured_dump_path>" ./scripts/xtrabackup_to_gcs.sh
 #    (full commands: runbook section 4, Option B)
+
+# 4. Phase 2: create the migration job and demote the destination
+terraform plan -out=tfplan
+terraform apply tfplan
 ```
 
 ### Day-2 DMS Job Verification, Monitoring & Cutover Promotion
@@ -198,14 +213,16 @@ make verify-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live
 make start-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
 
 # Monitor the job state and phase (FULL_DUMP -> CDC). Replication lag is in Cloud Monitoring:
-# datamigration.googleapis.com/migration_job/max_replica_sec_lag and max_replica_bytes_lag
+# datamigration.googleapis.com/migration_job/max_replica_sec_lag; make lag falls back to the
+# destination's cloudsql.googleapis.com/database/replication/replica_lag when CLOUDSQL_INSTANCE is set
 make status-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
+make lag PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc LAG_MINUTES=30 CLOUDSQL_INSTANCE=<cloudsql_instance_name>
 
 # Promote the Cloud SQL destination during the cutover window
 make promote-job PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc
 ```
 
-After promotion, applications connect to `terraform output -raw psc_endpoint_dns_name` (the instance DNS name, resolved by the private zone to the PSC endpoint IP).
+Before you promote, complete the Go / No-Go checklist and the rollback decision in runbook section 8. After promotion, applications connect to `terraform output -raw psc_endpoint_dns_name` (the instance DNS name, resolved by the private zone to the PSC endpoint IP); then run `terraform plan`/`apply` (runbook section 9.1). For teardown and decommission, see runbook section 10.
 
 ---
 

@@ -4,20 +4,37 @@
 
 > [!IMPORTANT]
 > **Target MySQL Version Policy (`MYSQL_8_0` & `MYSQL_8_4` LTS)**
-> Google Cloud Database Migration Service (DMS) supports migrating from **MySQL 8.0** to **Cloud SQL for MySQL 8.0 (`MYSQL_8_0`)** or **Cloud SQL for MySQL 8.4 LTS (`MYSQL_8_4`)**.
-> MySQL and Cloud DMS **do not support skipping major LTS versions** (for example, migrating directly from `8.0` to `9.7` in a single DMS step). To adopt MySQL `9.x` in the future, migrate to `MYSQL_8_4` (or `MYSQL_8_0` first, then upgrade in-place to `8.4`), promote the instance, and execute a controlled post-promotion major version upgrade (`8.0 -> 8.4 -> 9.x`).
+> These templates migrate a **MySQL 8.0** source to **Cloud SQL for MySQL 8.0 (`MYSQL_8_0`)** or **Cloud SQL for MySQL 8.4 LTS (`MYSQL_8_4`)** with Database Migration Service (DMS). MySQL doesn't support skipping major versions, so an 8.0 source can't go directly to a later major version. For the versions that Cloud SQL currently offers, see [Database versions and version policies](https://cloud.google.com/sql/docs/mysql/db-versions). Any later major version change is a separate in-place upgrade after promotion (section 9.2). See [Upgrade the database major version in-place](https://cloud.google.com/sql/docs/mysql/upgrade-major-db-version-inplace).
+
+```mermaid
+flowchart LR
+  P1["Phases 1-2<br/>Source pre-flight (make preflight)<br/>+ PSC network design"] --> P3["Phase 3<br/>terraform apply<br/>+ seed (Scenario 2)"]
+  P3 --> P4["Phase 4<br/>Users, grants,<br/>DEFINERs, flags"]
+  P4 --> P5["Phase 5<br/>verify + start"]
+  P5 --> P6["Phase 6<br/>Monitor lag<br/>+ validate data"]
+  P6 --> GO{"Go / No-Go<br/>checklist"}
+  GO -->|"Go"| P7["Phase 7<br/>Cutover: promote<br/>+ repoint apps"]
+  GO -->|"No-go"| P6
+  P7 --> P8["Phase 8<br/>terraform plan/apply<br/>+ decommission"]
+```
 
 ---
 
 ## 1. Migration Decision Matrix: Scenario 1 vs. Scenario 2
 
+This matrix is the single source of the scenario guidance; the [README](../README.md) links here. DMS documents no database-size threshold for choosing between the two scenarios, so decide on the factors below and rehearse with production-sized data.
+
 | Criteria | Scenario 1: Live Migration + Continuous CDC (`01-live-migration-gce-cdc`) | Scenario 2: Backup in GCS + Continuous CDC (`02-backup-migration-gcs-cdc`) |
 | :--- | :--- | :--- |
-| **Database Size** | Small to Medium (`< 500 GB`) | Large to Multi-Terabyte (`500 GB – 15+ TB`) |
+| **Database Size & Dump Window** | The DMS-managed dump of the whole database finishes well inside the binlog retention window | The database is too large, or the source too busy, for a DMS-managed dump inside an acceptable window |
 | **Initial Seed Mechanism** | DMS-managed parallel logical dump (`dump_type = "LOGICAL"`, `dump_parallel_level = "OPTIMAL"`) directly from the source MySQL 8.0 | mysqldump file (`dump_type = "LOGICAL"`, default) or prepared Percona XtraBackup folder (`dump_type = "PHYSICAL"`, `MYSQL_8_0` target only) in GCS via `dump_path` |
-| **Impact on Source Primary** | Moderate read I/O & CPU during initial parallel dump | No DMS dump load; you run mysqldump or XtraBackup on your own schedule |
+| **Impact on Source Primary** | Read I/O & CPU during the parallel dump; the source needs headroom for it | No DMS dump load; you run mysqldump or XtraBackup on your own schedule |
+| **Binlog Retention** | Longer than the full DMS dump and load, plus a buffer | Longer than dump + upload + DMS restore, plus a buffer |
 | **Ongoing Replication** | Continuous GTID Binlog CDC (`type = "CONTINUOUS"`) | Continuous GTID Binlog CDC (`type = "CONTINUOUS"`) automatically resumed from backup GTID coordinates |
-| **Cutover Downtime** | Near-zero (minutes during final promotion) | Near-zero (minutes during final promotion) |
+| **Cutover Downtime** | Writes stop from source read-only until applications reconnect to the promoted instance; measure it in a rehearsal | Same as Scenario 1 |
+
+> [!NOTE]
+> Point DMS at the source **primary**. When you migrate from a self-managed MySQL read replica, DMS doesn't support GTID and requires binary log file and position replication, which these templates don't configure. Sources: [Known limitations](https://cloud.google.com/database-migration/docs/mysql/known-limitations), [Configure your source database](https://cloud.google.com/database-migration/docs/mysql/configure-source-database-continuous).
 
 ### 1.1 Seed Support Matrix
 
@@ -30,11 +47,38 @@
 > [!WARNING]
 > DMS doesn't support physical (XtraBackup) migrations to MySQL 8.4. Template 02 rejects `dump_type = "PHYSICAL"` unless `target_database_version = "MYSQL_8_0"`. The physical backup must be **prepared** and uploaded to a **dedicated folder** that contains no other files, and no single backup file can exceed 5 TB. See [Migrate by using a Percona XtraBackup physical file](https://cloud.google.com/database-migration/docs/mysql/migrate-with-physical-xtrabackup).
 
+### 1.2 8.0 → 8.4 Specifics
+
+| Factor | Target `MYSQL_8_0` | Target `MYSQL_8_4` |
+| :--- | :--- | :--- |
+| **Migration type** | Same major version | Cross-version (8.0 → 8.4) |
+| **Seed options** | DMS dump, mysqldump, XtraBackup (`PHYSICAL`) | DMS dump, mysqldump (no `PHYSICAL`) |
+| **Destination flags** | No extra flag | `local_infile=on` is required; the Cloud SQL module adds it automatically |
+| **Authentication** | Cloud SQL `default_authentication_plugin` flag is available | `caching_sha2_password` is the default; `mysql_native_password` is disabled by default; the `default_authentication_plugin` flag isn't supported |
+| **Upgrade checker on the source** | Optional | Required: `util.checkForServerUpgrade` (below) |
+| **Fallback to the source after promotion** | Possible: configure the source as an external replica of Cloud SQL (section 8.2) | Not supported: forward-only (section 8.2) |
+| **Later upgrade to 8.4** | In-place major version upgrade with downtime (section 9.2) | Not needed |
+
+1. **`local_infile` (automatic):** DMS requires `local_infile=ON` on the destination for MySQL 8.0 → 8.4 migrations. When `target_database_version = "MYSQL_8_4"`, the `cloudsql-mysql-destination` module adds `local_infile=on` to the instance flags; you don't set it yourself. The same page says the DMS migration account can't have `BACKUP_ADMIN`. See [Known limitations](https://cloud.google.com/database-migration/docs/mysql/known-limitations).
+2. **Upgrade checker:** run the MySQL Shell upgrade checker against the source before you choose `MYSQL_8_4`, and fix every error it reports. Use MySQL Shell 8.4: the short form `8.4` checks against the Shell's own 8.4 release. The account needs `PROCESS` and `SELECT`; the utility prompts for the password. See [Upgrade Checker Utility](https://dev.mysql.com/doc/mysql-shell/8.4/en/mysql-shell-utilities-upgrade.html).
+   ```bash
+   # On the source VM (configPath must be a local file), with MySQL Shell 8.4.x
+   mysqlsh --js -e "util.checkForServerUpgrade('admin@127.0.0.1:3306', {targetVersion: '8.4', configPath: '/etc/mysql/my.cnf'})"
+   ```
+3. **Authentication plugins:** in MySQL 8.4, `caching_sha2_password` is the default authentication plugin, and `mysql_native_password` is disabled by default (it's removed in MySQL 9.0). On Cloud SQL, the `default_authentication_plugin` flag is supported in MySQL 8.0 only. Before cutover, recreate application accounts with `caching_sha2_password` (section 5) and confirm that every client driver and connector supports it. Sources: [caching_sha2_password](https://dev.mysql.com/doc/refman/8.4/en/caching-sha2-pluggable-authentication.html), [Native Pluggable Authentication](https://dev.mysql.com/doc/refman/8.4/en/native-pluggable-authentication.html), [Configure database flags](https://cloud.google.com/sql/docs/mysql/flags).
+
 ---
 
 ## 2. Phase 1: Source MySQL 8.0 Pre-Flight Verification
 
-Before starting either Scenario 1 or Scenario 2, verify the following mandatory parameters on the self-managed source MySQL 8.0 instance (`/etc/mysql/mysql.conf.d/mysqld.cnf` or `/etc/my.cnf`):
+Before starting either Scenario 1 or Scenario 2, prepare and verify the self-managed source MySQL 8.0 instance (`/etc/mysql/mysql.conf.d/mysqld.cnf` or `/etc/my.cnf`). The files in [`scripts/source-prep/`](../scripts/source-prep/README.md) implement this phase:
+
+| File | Purpose |
+| :--- | :--- |
+| `01_mysqld_dms_source.cnf` | `my.cnf` drop-in with the settings in section 2.1 |
+| `02_enable_gtid_online.sql` | Step-by-step online GTID enablement (section 2.2) |
+| `03_create_dms_user.sql` | Migration accounts and per-scenario grants (section 2.3) |
+| `preflight_check.sh` | Read-only PASS/WARN/FAIL report, also run by `make preflight` (section 2.4) |
 
 ### 2.1 Mandatory `my.cnf` Parameters for GTID & Binlog CDC
 
@@ -63,9 +107,17 @@ SHOW GLOBAL VARIABLES WHERE Variable_name IN (
 );
 ```
 
-### 2.2 Create the Migration Accounts
+**Network listener:** DMS connects to the source over the network, so `mysqld` must listen on the VM's private IP. Ubuntu's default MySQL configuration sets `bind-address = 127.0.0.1`; change it to the private IP (or `0.0.0.0`, restricted by firewall rules to the Network Attachment subnet) and restart `mysqld`. `make preflight` warns when `bind_address` is a loopback address.
 
-Use two separate accounts:
+**Binlog retention sizing:** DMS needs every binlog event after the seed's GTID position when CDC starts. If those binlogs are purged first, the job fails and you must take a new seed. Size `binlog_expire_logs_seconds` as **total seed time (dump + upload + DMS restore) + buffer**, and never below 7 days (604800 s). DMS says a week is generally sufficient. Check that the source has free disk space for the extra binlogs. See [Configure your source database](https://cloud.google.com/database-migration/docs/mysql/configure-source-database-continuous).
+
+### 2.2 Enable GTIDs Online (No Restart)
+
+If the source already writes binlogs but runs with `gtid_mode = OFF` and you can't restart it, follow `scripts/source-prep/02_enable_gtid_online.sql` **step by step** in an interactive session. Don't pipe the whole file into `mysql`. The order is: `enforce_gtid_consistency = WARN` (watch the error log under normal load), then `ON`, then `gtid_mode = OFF_PERMISSIVE`, then `ON_PERMISSIVE`, then wait until `Ongoing_anonymous_transaction_count` is `0`, then `gtid_mode = ON`. The script uses `SET PERSIST`. DMS accepts only `gtid_mode` `ON` or `OFF`; the permissive states fail `verify`. Sources: [Enabling GTID Transactions Online](https://dev.mysql.com/doc/refman/8.0/en/replication-mode-change-online-enable-gtids.html), [Configure your source database](https://cloud.google.com/database-migration/docs/mysql/configure-source-database-continuous).
+
+### 2.3 Create the Migration Accounts
+
+Use two separate accounts (`scripts/source-prep/03_create_dms_user.sql` creates both):
 
 | Account | Used by | Host | Privileges |
 | :--- | :--- | :--- | :--- |
@@ -98,6 +150,19 @@ GRANT SELECT ON performance_schema.keyring_component_status TO 'xtrabackup'@'loc
 > [!NOTE]
 > For the Scenario 2 `LOGICAL` seed, run `mysqldump` with an existing administrative account that can read every migrated database (it needs `SELECT`, `SHOW VIEW`, `TRIGGER`, `EVENT`, `LOCK TABLES` and `RELOAD`). Pass credentials through a `0600` option file (`--defaults-extra-file`), never with `--password=` on the command line. References: [Configure your source database](https://cloud.google.com/database-migration/docs/mysql/configure-source-database-continuous), [Percona XtraBackup privileges](https://docs.percona.com/percona-xtrabackup/8.0/privileges.html).
 
+### 2.4 Run the Pre-Flight Check
+
+Run the read-only check on the source VM, fix every FAIL, and run it again until it reports no FAIL. It exits `0` when there is no FAIL, `1` when at least one check fails, and `2` on a usage or connection error. Besides the settings above, it checks the grants of the DMS user (including no `BACKUP_ADMIN`), binlog retention against `SEED_HOURS`, non-InnoDB tables, tables without a primary key or a unique `NOT NULL` key, DEFINERs, references to system schemas, `lower_case_table_names`, character set and collation, `sql_mode`, time zone, `innodb_page_size` and database size.
+
+```bash
+# ~/.my-dms.cnf (chmod 600) contains: [client] user=... password=...
+make preflight MYSQL_DEFAULTS_FILE=~/.my-dms.cnf SCENARIO=1 DMS_USER=dms_migration SEED_HOURS=24
+
+# Same check without make (optional: --backup-gtid '<set>', --host/--port or --socket)
+MYSQL_DEFAULTS_FILE=~/.my-dms.cnf ./scripts/source-prep/preflight_check.sh \
+  --scenario 1 --dms-user dms_migration --seed-hours 24
+```
+
 ---
 
 ## 3. Phase 2: Private Service Connect (PSC) & Outbound Network Attachment Architecture
@@ -117,9 +182,12 @@ Both templates default to **Private Service Connect (`connectivity_type = "PSC"`
 
 ---
 
-## 4. Phase 3: Executing the Migration
+## 4. Phase 3: Deploy and Seed
 
-Complete the [Prerequisites](../README.md#3-prerequisites) first. The order is always: **apply → produce the seed (Scenario 2) → verify → start**.
+Complete the [Prerequisites](../README.md#3-prerequisites) and Phase 1 first. The order is: Scenario 1 **apply → users, grants, DEFINERs and flags (section 5) → verify → start (section 6)**; Scenario 2 **apply with `create_migration_job = false` → produce the seed → apply (creates the job) → section 5 → verify → start**.
+
+> [!IMPORTANT]
+> Decide `cloudsql_lower_case_table_names` **before the first apply**. Cloud SQL for MySQL 8.0 and later accepts `lower_case_table_names` only when the instance is created, and you can't change it afterwards. Set it to the source value (`SELECT @@lower_case_table_names;`, also reported by `make preflight`); leave it `null` to keep the Cloud SQL default (`0`). See [Configure database flags](https://cloud.google.com/sql/docs/mysql/flags).
 
 ### Option A: Scenario 1 — Live Migration + Continuous CDC (`templates/01-live-migration-gce-cdc`)
 
@@ -134,22 +202,13 @@ Complete the [Prerequisites](../README.md#3-prerequisites) first. The order is a
    terraform validate
    terraform apply
    ```
-2. **Run Pre-Flight Verification**:
-   ```bash
-   gcloud database-migration migration-jobs verify gce-live-mysql80-cdc \
-     --region=europe-west2
-   ```
-3. **Start Live Dump + Continuous CDC**:
-   ```bash
-   gcloud database-migration migration-jobs start gce-live-mysql80-cdc \
-     --region=europe-west2
-   ```
+2. **Continue with section 5**, then verify and start the job in section 6 (job ID `gce-live-mysql80-cdc`).
 
 ---
 
 ### Option B: Scenario 2 — Backup in GCS + Continuous CDC (`templates/02-backup-migration-gcs-cdc`)
 
-1. **Deploy Terraform Infrastructure (GCS Staging Bucket + IAM + Cloud SQL + DMS Job)**:
+1. **Deploy Terraform Infrastructure, Phase 1 (GCS Staging Bucket + IAM + Cloud SQL + PSC Endpoint + Connection Profiles)**. Scenario 2 is a two-phase apply: DMS rejects job creation with "The supplied dump file doesn't exist" until the seed is at `dump_path`, so the first apply sets `create_migration_job = false`. Terraform grants `backup_writer_members` `roles/storage.objectCreator` and `roles/storage.objectViewer` on the bucket; `gcloud storage cp` needs both (`storage.objects.get`).
    ```bash
    cd templates/02-backup-migration-gcs-cdc
    cp terraform.tfvars.example terraform.tfvars
@@ -158,7 +217,8 @@ Complete the [Prerequisites](../README.md#3-prerequisites) first. The order is a
    export TF_VAR_source_gce_mysql_password='REPLACE_ME_MAX_32_CHARS'
    terraform init
    terraform validate
-   terraform apply
+   # Phase 1: everything except the migration job (DMS checks dump_path when the job is created)
+   terraform apply -var create_migration_job=false
 
    # The single seed location used by the migration job
    terraform output -raw configured_dump_path
@@ -184,13 +244,76 @@ Complete the [Prerequisites](../README.md#3-prerequisites) first. The order is a
      ```
      List only application databases in `--databases` (not `mysql`, `sys`, `performance_schema` or `information_schema`), don't use `--master-data`/`--source-data` when GTID is on, and don't run DDL while the dump runs. See [Exporting a MySQL database using mysqldump](https://cloud.google.com/database-migration/docs/mysql/mysql-dump).
    - **Physical seed (`dump_type = "PHYSICAL"`, `MYSQL_8_0` target only — Percona XtraBackup 8.0)**:
-     Copy [`scripts/xtrabackup_to_gcs.sh`](../templates/02-backup-migration-gcs-cdc/scripts/xtrabackup_to_gcs.sh) to the source VM and run it. It checks `innodb_page_size`, the XtraBackup and server versions, free disk and that the folder is empty, then runs `--backup`, `--prepare` and `gcloud storage cp -r` into the folder:
+     Copy [`scripts/xtrabackup_to_gcs.sh`](../templates/02-backup-migration-gcs-cdc/scripts/xtrabackup_to_gcs.sh) to the source VM and run it. It checks `innodb_page_size`, the XtraBackup and server versions, free disk and that the folder is empty, then runs `--backup`, `--prepare` and `gcloud storage rsync --recursive` into the folder. Prefer an XtraBackup release equal to or later than the server. If XtraBackup is older than the server but is 8.0.34 or later, the script warns and adds `--lock-ddl=ON`, which Percona supports for backing up newer servers; older XtraBackup releases are rejected. See [Server version and backup version comparison](https://docs.percona.com/percona-xtrabackup/8.0/server-backup-version-comparison.html).
      ```bash
      export GCS_BACKUP_FOLDER="gs://my-dms-staging-bucket/xtrabackup/mysql80-full"   # = configured_dump_path
      export XTRABACKUP_USER="xtrabackup"   # the script prompts for the password
      sudo -E ./xtrabackup_to_gcs.sh
      ```
-3. **Verify & Start Backup-Seeded CDC Migration Job**:
+3. **Create the Migration Job (Phase 2)** after the seed is complete at `configured_dump_path`. This apply creates the job and demotes the destination:
+   ```bash
+   terraform apply   # create_migration_job = true (default)
+   ```
+4. **Continue with section 5**, then verify and start the job in section 6 (job ID `gcs-bkp-mysql80-cdc`).
+
+---
+
+## 5. Phase 4: Users, Grants, DEFINERs and Flags
+
+DMS doesn't migrate user accounts, logins or the `mysql` system database, and it doesn't migrate non-default flag settings. Objects whose `DEFINER` references an account that doesn't exist on the destination fail when they are invoked. Complete this phase after `apply` and **before `start`**. Sources: [Migration fidelity](https://cloud.google.com/database-migration/docs/mysql/migration-fidelity), [DEFINER clause](https://cloud.google.com/database-migration/docs/mysql/mysql-definer).
+
+1. **Export accounts and grants from the source**:
+   ```sql
+   -- Application accounts (exclude system accounts and the migration accounts)
+   SELECT user, host, plugin FROM mysql.user
+   WHERE user NOT IN ('root', 'mysql.sys', 'mysql.session', 'mysql.infoschema', 'dms_migration', 'xtrabackup');
+
+   -- For each account in the result:
+   SHOW CREATE USER 'app_user'@'%';
+   SHOW GRANTS FOR 'app_user'@'%';
+   ```
+2. **Audit DEFINERs on the source**. Every definer must exist on the destination before `start`. If `'root'@'localhost'` is a definer, the migration fails: change the definer to another account, or to `SQL SECURITY INVOKER`, first.
+   ```sql
+   SELECT DISTINCT DEFINER FROM INFORMATION_SCHEMA.EVENTS   WHERE EVENT_SCHEMA   NOT IN ('mysql', 'sys');
+   SELECT DISTINCT DEFINER FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA NOT IN ('mysql', 'sys');
+   SELECT DISTINCT DEFINER FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_SCHEMA NOT IN ('mysql', 'sys');
+   SELECT DISTINCT DEFINER FROM INFORMATION_SCHEMA.VIEWS    WHERE TABLE_SCHEMA   NOT IN ('mysql', 'sys');
+   ```
+3. **Create the accounts on the destination before `start`**. The destination is a DMS read replica at this point, so create users through the Cloud SQL Admin API (console **Users** tab or `gcloud sql users create`, which works on the demoted replica), not with `CREATE USER` in a mysql session. The module recreates `root@'%'` with the write-only root password before demotion, so you can log in as `root` for validation; you can also create a separate validation login the same way. `gcloud sql users create --password` puts the password on the command line: use it for DEFINER-only accounts with a throwaway password, and set real application passwords in the console or after promotion. Cloud SQL grants users created this way the `cloudsqlsuperuser` role. Sources: [DEFINER clause](https://cloud.google.com/database-migration/docs/mysql/mysql-definer), [About MySQL users](https://cloud.google.com/sql/docs/mysql/users).
+   ```bash
+   INSTANCE="$(terraform output -raw cloudsql_instance_name)"
+   # DEFINER-only account: throwaway password, reset after promotion
+   gcloud sql users create app_definer --host='%' --instance="${INSTANCE}" \
+     --password="$(openssl rand -base64 24)"
+   gcloud sql users list --instance="${INSTANCE}"
+   ```
+   After promotion (section 8), apply the exported `GRANT` statements, `REVOKE` privileges that each account shouldn't have (including `cloudsqlsuperuser`), and reset passwords with `ALTER USER`. On a `MYSQL_8_4` target, use `IDENTIFIED WITH caching_sha2_password` (section 1.2). Cloud SQL doesn't grant `SUPER` or `FILE`; drop those from the exported grants.
+4. **Compare flags**. Run `SHOW VARIABLES` on the source and on the destination, and set the differences that matter on Cloud SQL. Not every MySQL flag is allowed on Cloud SQL. The root templates expose `cloudsql_lower_case_table_names` (create time only, section 4) and add `local_infile` for `MYSQL_8_4`. For other flags, pass the module's `database_flags` input from your root module after promotion; `gcloud sql instances patch --database-flags` replaces the whole flag list. See [Configure database flags](https://cloud.google.com/sql/docs/mysql/flags).
+   ```bash
+   mysql --defaults-extra-file="${HOME}/.my-dms.cnf" --host=127.0.0.1 -N -e "SHOW GLOBAL VARIABLES" | sort > source_vars.txt
+   mysql --defaults-extra-file="${HOME}/.my-dst.cnf" --host="<psc_endpoint_dns_name>" -N -e "SHOW GLOBAL VARIABLES" | sort > dest_vars.txt
+   diff source_vars.txt dest_vars.txt \
+     | grep -E 'sql_mode|time_zone|character_set_server|collation_server|lower_case_table_names|max_allowed_packet|group_concat_max_len'
+   ```
+
+---
+
+## 6. Phase 5: Verify and Start the Migration Job
+
+> [!WARNING]
+> Don't run `terraform apply` on the destination between `start` and `promote`. DMS modifies the backup and recovery settings (backups, point-in-time recovery) of the destination instance, so the instance differs from the Terraform configuration (in testing, `terraform plan` after demotion wanted to re-enable automated backups), and an apply would try to change a running DMS replica. Run `terraform plan` and `terraform apply` after promotion (section 9.1). See [Known limitations](https://cloud.google.com/database-migration/docs/mysql/known-limitations).
+
+1. **Run DMS Verification** (connectivity, GTID/binlog settings and, for Scenario 2, bucket access):
+   ```bash
+   gcloud database-migration migration-jobs verify gce-live-mysql80-cdc \
+     --region=europe-west2
+   ```
+2. **Start the Job** (Scenario 1: live dump + continuous CDC):
+   ```bash
+   gcloud database-migration migration-jobs start gce-live-mysql80-cdc \
+     --region=europe-west2
+   ```
+3. **Scenario 2** uses the same two commands with its job ID:
    ```bash
    gcloud database-migration migration-jobs verify gcs-bkp-mysql80-cdc \
      --region=europe-west2
@@ -201,7 +324,7 @@ Complete the [Prerequisites](../README.md#3-prerequisites) first. The order is a
 
 ---
 
-## 5. Phase 4: Monitoring CDC Replication Lag & Data Verification
+## 7. Phase 6: Monitoring CDC Replication Lag & Data Verification
 
 1. **Check Migration Job Phase & State**:
    ```bash
@@ -210,21 +333,62 @@ Complete the [Prerequisites](../README.md#3-prerequisites) first. The order is a
      --format="table(name, state, phase, duration)"
    ```
    - Wait for `phase` to transition from `FULL_DUMP` to `CDC`.
-2. **Monitor Cloud Monitoring Metrics**:
-   - Track `datamigration.googleapis.com/migration_job/max_replica_sec_lag` and `datamigration.googleapis.com/migration_job/max_replica_bytes_lag` in Cloud Monitoring until replication lag stabilizes near `0`. See [Migration job metrics](https://cloud.google.com/database-migration/docs/mysql/migration-job-metrics).
+2. **Monitor Replication Lag**:
+   - `make lag` reads `datamigration.googleapis.com/migration_job/max_replica_sec_lag` for the job from the Cloud Monitoring API (last `LAG_MINUTES` minutes). In testing, the DMS job metrics returned no data for jobs that had been in CDC for a few minutes, so when `CLOUDSQL_INSTANCE` is set, `make lag` falls back to the destination's `cloudsql.googleapis.com/database/replication/replica_lag` and prints which metric it used. Metrics can take several minutes to appear. Wait until the lag stabilizes near `0`. See [Migration job metrics](https://cloud.google.com/database-migration/docs/mysql/migration-job-metrics) and [Replication lag](https://cloud.google.com/sql/docs/mysql/replication/replication-lag).
+   ```bash
+   make lag PROJECT_ID=my-gcp-project-01 REGION=europe-west2 JOB_ID=gce-live-mysql80-cdc LAG_MINUTES=30 \
+     CLOUDSQL_INSTANCE="$(terraform -chdir=templates/01-live-migration-gce-cdc output -raw cloudsql_instance_name)"
+   ```
 3. **Verify GTID Convergence**:
-   - On the source MySQL 8.0:
+   - On the source MySQL 8.0, read the executed GTID set:
      ```sql
      SELECT @@GLOBAL.gtid_executed;
      ```
-   - On the destination Cloud SQL replica (read-only during CDC), connect through the PSC endpoint DNS name (`psc_endpoint_dns_name` Terraform output):
+   - On the destination Cloud SQL replica (read-only during CDC), connect through the PSC endpoint DNS name (`psc_endpoint_dns_name` Terraform output) and check that the source set is contained in the destination set. Don't compare the two strings: the destination set can contain other GTIDs. See [GTID functions](https://dev.mysql.com/doc/refman/8.4/en/gtid-functions.html).
      ```sql
-     SELECT @@GLOBAL.gtid_executed;
+     -- Paste the source value. 1 = every source transaction has been applied.
+     SELECT GTID_SUBSET('<source gtid_executed>', @@GLOBAL.gtid_executed) AS caught_up;
      ```
+4. **Validate Data with the Data Validation Tool (optional)**:
+   - The [Data Validation Tool (DVT)](https://github.com/GoogleCloudPlatform/professional-services-data-validator) compares row counts (and optionally aggregates, rows and schemas) between source and destination. Install it on a host that reaches both databases, create the two connections once, then run count validation with `make validate-data`. With `--secret-manager-type GCP`, `--password` takes a Secret Manager secret name instead of the password. Run the final comparison after the source is read-only (section 8).
+   ```bash
+   pip install google-pso-data-validator
+
+   data-validation connections add \
+     --secret-manager-type GCP --secret-manager-project-id my-gcp-project-01 \
+     --connection-name dms_src MySQL \
+     --host 10.10.0.10 --port 3306 --user dvt_reader --password dvt-src-password-secret --database app_db1
+   data-validation connections add \
+     --secret-manager-type GCP --secret-manager-project-id my-gcp-project-01 \
+     --connection-name dms_tgt MySQL \
+     --host "<psc_endpoint_dns_name>" --port 3306 --user dvt_reader --password dvt-tgt-password-secret --database app_db1
+
+   make validate-data DVT_SOURCE_CONN=dms_src DVT_TARGET_CONN=dms_tgt DVT_TABLES='app_db1.orders,app_db1.customers'
+   ```
 
 ---
 
-## 6. Phase 5: Near-Zero Downtime Cutover (Promotion)
+## 8. Phase 7: Cutover (Promotion)
+
+### 8.1 Go / No-Go Checklist
+
+Promote only when every item is checked and recorded:
+
+| Check | How | Go when |
+| :--- | :--- | :--- |
+| Replication lag | `make lag` (section 7) | `max_replica_sec_lag` (or `replica_lag`) ≈ `0` and stable |
+| GTID convergence | `GTID_SUBSET('<source gtid_executed>', @@GLOBAL.gtid_executed)` on the destination, after the source is read-only | Returns `1` |
+| Data validation | DVT count validation, `make validate-data` (optional) | No mismatches |
+| Users, grants and DEFINERs | `gcloud sql users list`; the section 5 audit | Every application account and definer exists |
+| Application connectivity | From an application host, connect to the `psc_endpoint_dns_name` output | Login succeeds |
+| Rollback decision | Section 8.2 | Recorded and signed off |
+
+### 8.2 Rollback Decision
+
+- **`MYSQL_8_4` target is forward-only.** MySQL supports replication from an older source to a newer replica; replication from newer sources to older replicas is generally not supported. After promotion, you can't replicate the 8.4 instance back into the 8.0 source. See [Replication Compatibility Between MySQL Versions](https://dev.mysql.com/doc/refman/8.4/en/replication-compatibility.html).
+- **When fallback is mandatory**, migrate to `MYSQL_8_0` instead. After promotion, configure the old source as an external replica of the Cloud SQL instance, so it stays current and can take traffic back. Upgrade Cloud SQL to 8.4 in place later (section 9.2), when you no longer need the fallback. The old source must reach the instance over the network (with these templates, through the PSC endpoint), and the external replica guide describes IP-based access, so rehearse this setup before you rely on it. See [Configure external replicas](https://cloud.google.com/sql/docs/mysql/replication/configure-external-replica).
+
+### 8.3 Cutover Steps
 
 Perform the following sequence during the scheduled cutover window:
 
@@ -234,14 +398,15 @@ Perform the following sequence during the scheduled cutover window:
    SET GLOBAL read_only = ON;
    ```
 2. **Confirm Zero Replication Lag**:
-   Verify that `SELECT @@GLOBAL.gtid_executed;` on the destination Cloud SQL instance matches the source MySQL 8.0 instance.
+   Run the `GTID_SUBSET` check from section 7 against the final source `gtid_executed`; it must return `1`. Complete the Go / No-Go checklist (section 8.1).
 3. **Promote the Cloud DMS Migration Job**:
    ```bash
    gcloud database-migration migration-jobs promote gce-live-mysql80-cdc \
      --region=europe-west2
    ```
    - Cloud DMS disconnects replication from the source MySQL 8.0 and promotes the Cloud SQL for MySQL (`MYSQL_8_4` or `MYSQL_8_0`) instance to a standalone writable primary (`state = COMPLETED`).
-4. **Repoint Application Endpoints**:
+4. **Apply Grants and Passwords**: run the section 5 post-promotion steps (`GRANT`, `REVOKE`, `ALTER USER`).
+5. **Repoint Application Endpoints**:
    - Point your connection strings to the PSC endpoint DNS name (`psc_endpoint_dns_name` Terraform output). The private zone created by Terraform resolves it to the PSC endpoint IP (`psc_endpoint_ip_address`) inside `network`. Test from an application host:
      ```bash
      mysql --host="<psc_endpoint_dns_name>" --user="<app_user>" -p -e "SELECT @@hostname, @@version;"
@@ -249,7 +414,71 @@ Perform the following sequence during the scheduled cutover window:
 
 ---
 
-## 7. Phase 6: Post-Promotion Major Version Upgrade Path (`8.0 -> 8.4 -> 9.x`)
+## 9. Phase 8: Post-Promotion
 
-- If you migrated to **`MYSQL_8_0`** first for strict parity with the source MySQL 8.0, you can perform an in-place major version upgrade to **`MYSQL_8_4` LTS** via Terraform by updating `target_database_version = "MYSQL_8_4"` and running `terraform apply`.
-- When Google Cloud SQL releases general availability support for MySQL **`9.x`** (`MYSQL_9_7` / innovation or LTS track), instances running on **`MYSQL_8_4`** can then follow the supported sequential major version upgrade path (`8.0 -> 8.4 -> 9.x`) with near-zero downtime using Cloud SQL Enterprise Plus rolling maintenance.
+### 9.1 Reconcile Terraform
+
+DMS changed the destination's backup and recovery settings during the migration (section 6). In testing, `terraform plan` after demotion showed automated backups `enabled false -> true`, and after promotion it showed `retained_backups 7 -> 30` and removal of the `goog-dms-instance` label. After promotion, review the drift and re-apply your configuration; the next `terraform plan` should report no changes:
+
+```bash
+terraform plan -out=tfplan   # Review: expect backup/PITR settings to be restored, nothing replaced
+terraform apply tfplan
+```
+
+Don't apply a plan that replaces or destroys `module.cloudsql_destination`. To keep Cloud SQL and retire the migration objects, follow section 10.2 instead.
+
+### 9.2 Major Version Upgrade Path
+
+- If you migrated to **`MYSQL_8_0`** (for example, to keep the section 8.2 fallback), you can upgrade in place to **`MYSQL_8_4`** by setting `target_database_version = "MYSQL_8_4"` and running `terraform apply`, or with `gcloud sql instances patch --database-version`.
+- Upgrades go one major version at a time; MySQL doesn't support skipping major versions. Later major versions follow the same path: check which versions Cloud SQL offers in [Database versions and version policies](https://cloud.google.com/sql/docs/mysql/db-versions).
+- A major version upgrade **makes the instance unavailable for a period of time**. Plan a maintenance window, run the upgrade precheck (Preview), and do a dry run on a clone first. See [Upgrade the database major version in-place](https://cloud.google.com/sql/docs/mysql/upgrade-major-db-version-inplace).
+
+---
+
+## 10. Teardown and Decommission
+
+> [!CAUTION]
+> `gcloud database-migration migration-jobs delete` always deletes the destination connection profile with the job, and with `--force` it also deletes the destination Cloud SQL replica database. Never use `--force` on a production migration. Check with `gcloud database-migration migration-jobs delete --help`.
+
+### 10.1 Test Environment
+
+1. **Delete the migration job** first, so that `terraform destroy` doesn't depend on DMS releasing the destination:
+   ```bash
+   gcloud database-migration migration-jobs delete gce-live-mysql80-cdc \
+     --region=europe-west2
+   ```
+2. **Turn off deletion protection**: set `cloudsql_deletion_protection = false` in `terraform.tfvars`, then run `terraform apply`.
+3. **Destroy the stack**:
+   ```bash
+   terraform destroy
+   ```
+4. **Delete the staging bucket last** (Scenario 2). It is versioned; unless `staging_bucket_force_destroy = true`, `terraform destroy` can't delete it while it still holds objects. Delete the objects, then run `terraform destroy` again:
+   ```bash
+   gcloud storage rm --recursive --all-versions "gs://my-dms-staging-bucket/**"
+   terraform destroy
+   ```
+
+### 10.2 Production After Cutover
+
+Keep the Cloud SQL instance and retire only the migration objects: the DMS job, the connection profiles and the Network Attachment.
+
+1. **Detach the Network Attachment from the instance**. The Network Attachment can't be deleted while the instance still uses it. This operation **restarts the instance** (in testing it took about 5 minutes), so run it in a maintenance window:
+   ```bash
+   gcloud sql instances patch "$(terraform output -raw cloudsql_instance_name)" \
+     --clear-psc-network-attachment-uri
+   ```
+2. **Move the instance out of the migration stack**. Back up the state, then remove the instance and the PSC endpoint from it, and import them into a long-lived stack (`import` blocks) that keeps `deletion_protection` on:
+   ```bash
+   terraform state pull > pre-decommission.tfstate
+   terraform state rm module.cloudsql_destination module.cloudsql_psc_endpoint
+   ```
+3. **Delete the migration job without `--force`**:
+   ```bash
+   gcloud database-migration migration-jobs delete gce-live-mysql80-cdc \
+     --region=europe-west2
+   ```
+4. **Destroy the remaining migration objects** (connection profiles, Network Attachment, and the bucket for Scenario 2). Review the plan first: it must not contain the Cloud SQL instance.
+   ```bash
+   terraform plan -destroy
+   terraform destroy
+   ```
