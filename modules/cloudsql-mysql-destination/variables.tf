@@ -75,6 +75,12 @@ variable "allowed_psc_projects" {
   default     = []
 }
 
+variable "psc_outbound_enabled" {
+  description = "Whether to attach psc_network_attachment_uri to the instance (PSC outbound / PSC interface) so that DMS replication can reach the source VPC."
+  type        = bool
+  default     = false
+}
+
 variable "psc_network_attachment_uri" {
   description = "The URI of the Compute Engine Network Attachment (PSCI) used by the Cloud SQL instance for Private Service Connect outbound connections to the source VPC."
   type        = string
@@ -130,10 +136,16 @@ variable "deletion_protection" {
 }
 
 variable "root_password" {
-  description = "Initial root password for the Cloud SQL instance."
+  description = "Initial root password for the Cloud SQL instance. Sent through the write-only root_password_wo argument, so it is not stored in Terraform state."
   type        = string
   default     = null
   sensitive   = true
+}
+
+variable "root_password_wo_version" {
+  description = "Version of the write-only root password. Increment it to push a new root_password value to the instance."
+  type        = number
+  default     = 1
 }
 
 variable "database_flags" {
@@ -153,12 +165,6 @@ variable "backup_enabled" {
 
 variable "binary_log_enabled" {
   description = "Whether binary logging is enabled (required for HA, PITR, and downstream replication)."
-  type        = bool
-  default     = true
-}
-
-variable "point_in_time_recovery_enabled" {
-  description = "Whether Point-in-Time Recovery (PITR) is enabled."
   type        = bool
   default     = true
 }

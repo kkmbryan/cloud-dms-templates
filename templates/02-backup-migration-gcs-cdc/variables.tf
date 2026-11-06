@@ -4,9 +4,9 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "The GCP region for the migration (must match across GCS staging bucket, Cloud SQL, and Cloud DMS)."
+  description = "The GCP region for the migration. The Cloud SQL instance, DMS resources and (Scenario 2) the staging bucket must all be in this region."
   type        = string
-  default     = "asia-southeast1"
+  default     = "europe-west2"
 }
 
 variable "connectivity_type" {
@@ -45,7 +45,7 @@ variable "create_psa_peering" {
 
 # GCS Staging Bucket Configuration (Scenario 2 Backup Seed)
 variable "staging_bucket_name" {
-  description = "Globally unique name for the GCS staging bucket holding the Percona XtraBackup or mysqldump backup file."
+  description = "Globally unique name for the GCS staging bucket that holds the mysqldump file or the prepared Percona XtraBackup folder."
   type        = string
 }
 
@@ -61,27 +61,42 @@ variable "staging_bucket_retention_days" {
   default     = 14
 }
 
-variable "dms_service_account_email" {
-  description = "Cloud DMS / Cloud SQL service agent email granted read access to the staging bucket."
-  type        = string
-  default     = ""
-}
-
-variable "backup_writer_members" {
-  description = "List of IAM principals (e.g., GCE VM service account) granted roles/storage.objectAdmin on the staging bucket."
+variable "additional_bucket_reader_members" {
+  description = "Optional extra principals (full IAM member strings, for example 'group:dba-team@example.com') that get read access to the staging bucket. The Cloud SQL instance service account and the DMS service agent are granted automatically."
   type        = list(string)
   default     = []
 }
 
-variable "backup_object_path" {
-  description = "Object path inside the GCS staging bucket (e.g., 'backups/mysql80-full.xbstream.zst' for PHYSICAL XtraBackup or 'backups/mysql80-dump.sql.gz' for LOGICAL mysqldump)."
+variable "backup_writer_members" {
+  description = "IAM principals (for example the source VM's service account) granted roles/storage.objectCreator on the staging bucket to upload the seed."
+  type        = list(string)
+  default     = []
+}
+
+variable "backup_gcs_path" {
+  description = <<-EOT
+    Path of the seed inside the staging bucket, without 'gs://<bucket>/' and without a trailing slash.
+    - dump_type = "LOGICAL": one mysqldump file, for example 'mysqldump/mysql80-dump.sql.gz'.
+    - dump_type = "PHYSICAL": a dedicated folder that contains only the prepared Percona XtraBackup files, for example 'xtrabackup/mysql80-full'.
+    The DMS dump_path is gs://<staging_bucket_name>/<backup_gcs_path> (see the configured_dump_path output).
+  EOT
   type        = string
-  default     = "backups/mysql80-full.xbstream"
+  default     = "mysqldump/mysql80-dump.sql.gz"
+
+  validation {
+    condition     = length(var.backup_gcs_path) > 0 && !startswith(var.backup_gcs_path, "gs://") && !startswith(var.backup_gcs_path, "/") && !endswith(var.backup_gcs_path, "/")
+    error_message = "backup_gcs_path must be a path inside the bucket, with no 'gs://' prefix and no leading or trailing slash."
+  }
+
+  validation {
+    condition     = var.dump_type != "PHYSICAL" || !can(regex("\\.(sql|gz|zst|xbstream)$", var.backup_gcs_path))
+    error_message = "With dump_type = \"PHYSICAL\", backup_gcs_path must be a dedicated folder that holds the prepared XtraBackup files, not a single file."
+  }
 }
 
 # Cloud SQL Destination Configuration
 variable "destination_mode" {
-  description = "Destination provisioning mode: 'EXISTING_CLOUDSQL' (recommended default: provisions a standalone Cloud SQL instance with Private Service Connect, No Public IP, and PSC Outbound Network Attachment network_attachment_uri, and demotes it for DMS replication) or 'DMS_MANAGED_CLOUDSQL'."
+  description = "Destination provisioning mode: 'EXISTING_CLOUDSQL' (default: Terraform creates a PSC-only Cloud SQL instance with no public IP, attaches the Network Attachment, grants it bucket read access, and demotes it for DMS) or 'DMS_MANAGED_CLOUDSQL' (DMS creates the instance; you must then grant its service account read access to the bucket yourself)."
   type        = string
   default     = "EXISTING_CLOUDSQL"
 
@@ -104,7 +119,7 @@ variable "cloudsql_instance_name" {
 }
 
 variable "target_database_version" {
-  description = "Target Cloud SQL for MySQL version ('MYSQL_8_4' default LTS or 'MYSQL_8_0'). Note: For PHYSICAL XtraBackup imports, ensure source and destination minor/major compatibility per Cloud DMS guidelines."
+  description = "Target Cloud SQL for MySQL version ('MYSQL_8_4' default or 'MYSQL_8_0'). dump_type = 'PHYSICAL' (Percona XtraBackup) supports only 'MYSQL_8_0'."
   type        = string
   default     = "MYSQL_8_4"
 
@@ -139,9 +154,15 @@ variable "cloudsql_disk_size_gb" {
 }
 
 variable "cloudsql_root_password" {
-  description = "Root password for the destination Cloud SQL instance."
+  description = "Initial root password for the destination Cloud SQL instance. Sent through the write-only root_password_wo argument (EXISTING_CLOUDSQL), so it is not stored in Terraform state."
   type        = string
   sensitive   = true
+}
+
+variable "cloudsql_root_password_version" {
+  description = "Version of the write-only Cloud SQL root password. Increment it to push a new cloudsql_root_password to the instance (the password is never stored in Terraform state)."
+  type        = number
+  default     = 1
 }
 
 variable "cloudsql_deletion_protection" {
@@ -150,9 +171,46 @@ variable "cloudsql_deletion_protection" {
   default     = true
 }
 
+# PSC consumer endpoint + private DNS (application access after promotion)
+variable "create_psc_endpoint" {
+  description = "Create a PSC consumer endpoint (internal IP + forwarding rule) and a private DNS record for the Cloud SQL instance in var.network. Applies when destination_mode = EXISTING_CLOUDSQL and connectivity_type = PSC."
+  type        = bool
+  default     = true
+}
+
+variable "psc_endpoint_subnet" {
+  description = "Subnet (self-link or ID) for the PSC endpoint IP address, normally the application subnet. Defaults to var.subnet when empty."
+  type        = string
+  default     = ""
+}
+
+variable "psc_endpoint_ip_address" {
+  description = "Optional fixed internal IP address for the PSC endpoint. Leave empty to let Google Cloud choose one."
+  type        = string
+  default     = ""
+}
+
+variable "psc_endpoint_global_access" {
+  description = "Allow clients in other regions to use the PSC endpoint."
+  type        = bool
+  default     = false
+}
+
+variable "create_psc_dns_record" {
+  description = "Create an A record for the instance DNS name (cloudsql_dns_name) that points to the PSC endpoint IP."
+  type        = bool
+  default     = true
+}
+
+variable "psc_existing_dns_zone_name" {
+  description = "Name of an existing private Cloud DNS zone for '<region>.sql.goog.' bound to var.network. When empty, a new private zone is created. Set this if the VPC already has such a zone (for example for other Cloud SQL PSC instances)."
+  type        = string
+  default     = ""
+}
+
 # Source GCE MySQL 8.0 Connection Profile Configuration
 variable "source_gce_mysql_host" {
-  description = "Private IPv4 address or internal DNS hostname of the source GCE MySQL 8.0 VM (used for ongoing Binlog CDC after GCS backup restore)."
+  description = "Private IPv4 address or internal DNS hostname of the source MySQL 8.0 VM (used for binlog CDC after the seed is restored)."
   type        = string
 }
 
@@ -163,21 +221,15 @@ variable "source_gce_mysql_port" {
 }
 
 variable "source_gce_mysql_username" {
-  description = "Dedicated replication username on the source GCE MySQL 8.0 instance."
+  description = "Dedicated DMS migration user on the source MySQL 8.0 instance (created as 'dms_migration'@'%'; see the runbook for grants)."
   type        = string
-  default     = "dms_repl_user"
+  default     = "dms_migration"
 }
 
 variable "source_gce_mysql_password" {
-  description = "Password for the source GCE MySQL 8.0 replication user."
+  description = "Password of the source migration user (32 characters or fewer)."
   type        = string
   sensitive   = true
-}
-
-variable "destination_connection_host" {
-  description = "Optional override for destination Cloud SQL host IP/DNS in the DMS connection profile."
-  type        = string
-  default     = ""
 }
 
 # DMS Backup-Seeded Migration + CDC Job Configuration
@@ -188,20 +240,30 @@ variable "migration_job_id" {
 }
 
 variable "dump_type" {
-  description = "Backup format staged in GCS: 'PHYSICAL' (default for Percona XtraBackup non-blocking multi-TB backups) or 'LOGICAL' (mysqldump)."
+  description = "Seed format staged in GCS: 'LOGICAL' (default, mysqldump file; works for MYSQL_8_0 and MYSQL_8_4 targets) or 'PHYSICAL' (prepared Percona XtraBackup folder; MYSQL_8_0 target only)."
   type        = string
-  default     = "PHYSICAL"
+  default     = "LOGICAL"
 
   validation {
     condition     = contains(["PHYSICAL", "LOGICAL"], var.dump_type)
-    error_message = "dump_type must be either \"PHYSICAL\" (Percona XtraBackup) or \"LOGICAL\" (mysqldump)."
+    error_message = "dump_type must be either \"LOGICAL\" (mysqldump) or \"PHYSICAL\" (Percona XtraBackup)."
+  }
+
+  validation {
+    condition     = var.dump_type != "PHYSICAL" || var.target_database_version == "MYSQL_8_0"
+    error_message = "dump_type = \"PHYSICAL\" requires target_database_version = \"MYSQL_8_0\". Database Migration Service does not support physical (XtraBackup) migrations to MySQL 8.4. Use dump_type = \"LOGICAL\" for an 8.4 target."
   }
 }
 
 variable "connectivity_method" {
-  description = "Connectivity method used by the DMS migration job to reach the source GCE MySQL 8.0 VM for CDC ('VPC_PEERING', 'REVERSE_SSH', or 'STATIC_IP')."
+  description = "DMS_MANAGED_CLOUDSQL only: connectivity method for the migration job ('VPC_PEERING', 'REVERSE_SSH' or 'STATIC_IP'). Ignored for EXISTING_CLOUDSQL, which uses the PSC interface."
   type        = string
   default     = "VPC_PEERING"
+
+  validation {
+    condition     = contains(["VPC_PEERING", "REVERSE_SSH", "STATIC_IP"], var.connectivity_method)
+    error_message = "connectivity_method must be one of \"VPC_PEERING\", \"REVERSE_SSH\" or \"STATIC_IP\"."
+  }
 }
 
 variable "reverse_ssh_vm_ip" {

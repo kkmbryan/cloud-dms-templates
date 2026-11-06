@@ -1,16 +1,18 @@
-# Scenario 1: Live Migration from Self-Managed GCE MySQL 8.0 + Continuous CDC
+# Scenario 1: Live Migration from Self-Managed MySQL 8.0 on Compute Engine + Continuous CDC
 
 **English** | [简体中文](README.zh-CN.md)
 
 ## Overview
 
-This root Terraform template deploys an end-to-end **Live Initial Dump + Continuous Change Data Capture (CDC)** pipeline using **Google Cloud Database Migration Service (DMS)** to migrate self-managed **MySQL 8.0 on Compute Engine (GCE)** to **Cloud SQL for MySQL (`MYSQL_8_4` LTS default or `MYSQL_8_0`)** with near-zero downtime.
+This root Terraform template deploys an end-to-end **Live Initial Dump + Continuous Change Data Capture (CDC)** pipeline using **Database Migration Service (DMS)** to migrate self-managed **MySQL 8.0 on Compute Engine** to **Cloud SQL for MySQL (`MYSQL_8_4` default or `MYSQL_8_0`)** with a short cutover window. Default region: `europe-west2`.
 
 ### Key Architectural Highlights
 
-- **Target Version Flexibility (`MYSQL_8_4` or `MYSQL_8_0`)**: Defaults to `MYSQL_8_4` (Enterprise Plus with local SSD Data Cache enabled) while supporting `MYSQL_8_0`. Cloud DMS does not support skipping major versions directly from MySQL 8.0 to 9.7; if 9.x is required in the future, perform a post-promotion upgrade (`8.0 -> 8.4 -> 9.x`).
-- **Private Service Connect (PSC) Default**: Avoids transitive VPC peering constraints by provisioning a Compute Engine **Network Attachment** (`google_compute_network_attachment`) and binding Cloud SQL's **PSC Outbound** (`psc_config.network_attachment_uri`) with automated `demote-destination`, while also supporting traditional Private Services Access (`PSA`).
-- **High-Throughput Initial Load (`dump_parallel_level = "MAX"`)**: Uses DMS-managed multi-threaded logical dump directly from the live GCE MySQL 8.0 instance, automatically transitioning into continuous GTID Binlog replication (`type = "CONTINUOUS"`).
+- **Target Version Flexibility (`MYSQL_8_4` or `MYSQL_8_0`)**: Defaults to `MYSQL_8_4` (Enterprise Plus with Data Cache) while supporting `MYSQL_8_0`.
+- **Private Service Connect (PSC) Default**: Creates a Compute Engine **Network Attachment** and attaches it to the PSC-only Cloud SQL instance (PSC interface, `psc_config.network_attachment_uri`) so that DMS reaches the source in your VPC. Private Services Access (`PSA`) is optional.
+- **Application Access After Promotion**: Creates a **PSC consumer endpoint** (internal IP + forwarding rule) and a **private Cloud DNS record** for the instance DNS name (`create_psc_endpoint = true`).
+- **No Passwords on the Command Line**: The DMS connection profiles and the migration job are native Terraform resources. The Cloud SQL root password uses the write-only `root_password_wo` argument and is not stored in state.
+- **DMS-Managed Initial Load (`dump_parallel_level = "OPTIMAL"`)**: DMS runs a parallel logical dump from the live source and then switches to continuous GTID binlog replication (`type = "CONTINUOUS"`). `OPTIMAL` is the DMS recommendation; `MAX` adds load on the source.
 
 ---
 
@@ -18,35 +20,41 @@ This root Terraform template deploys an end-to-end **Live Initial Dump + Continu
 
 ```mermaid
 flowchart LR
-    subgraph GCE_VPC["Production VPC"]
-        GCE["GCE VM: Self-Managed MySQL 8.0<br/>(GTID=ON, ROW Binlog)"]
+    subgraph GCE_VPC["Customer VPC"]
+        GCE["Compute Engine VM: self-managed MySQL 8.0<br/>(GTID=ON, ROW binlog)"]
         NA["PSC Network Attachment<br/>(dms-mysql-psc-na)"]
+        EP["PSC endpoint + private DNS"]
     end
 
-    subgraph DMS_Control["Google Cloud DMS"]
-        JOB["DMS Migration Job<br/>(CONTINUOUS: MAX Parallel Dump + CDC<br/>+ demote-destination)"]
+    subgraph DMS_Control["Database Migration Service"]
+        JOB["DMS migration job<br/>(CONTINUOUS: OPTIMAL parallel dump + CDC<br/>+ demote-destination)"]
     end
 
     subgraph CloudSQL_Producer["Cloud SQL Producer VPC"]
-        CSQL["Cloud SQL for MySQL 8.4 / 8.0<br/>(Pure PSC + network_attachment_uri)"]
+        CSQL["Cloud SQL for MySQL 8.4 / 8.0<br/>(PSC only + network_attachment_uri)"]
     end
 
-    CSQL -->|"PSC Outbound: network_attachment_uri"| NA
-    NA -->|"Internal Routing (Port 3306)"| GCE
-    GCE -->|"Step 1: Parallel Logical Dump<br/>Step 2: Continuous Binlog CDC"| CSQL
-    JOB -->|"Orchestrates Dump, Demote & CDC"| CSQL
+    CSQL -->|"PSC interface: network_attachment_uri"| NA
+    NA -->|"Internal routing (port 3306)"| GCE
+    GCE -->|"Step 1: parallel logical dump<br/>Step 2: continuous binlog CDC"| CSQL
+    JOB -->|"Orchestrates dump, demote and CDC"| CSQL
+    EP -->|"Applications after promotion"| CSQL
 ```
 
 ---
 
 ## Usage Instructions
 
+Complete the [Prerequisites](../../README.md#3-prerequisites) and the source preparation in [runbook section 2](../../docs/gce_mysql80_to_cloudsql_dms_migration_runbook.md) first.
+
 ### 1. Configure Variables
 
-Copy `terraform.tfvars.example` to `terraform.tfvars` and populate your environment values:
+Copy `terraform.tfvars.example` to `terraform.tfvars` and populate your environment values. Pass passwords as environment variables instead of writing them to disk:
 
 ```bash
 cp terraform.tfvars.example terraform.tfvars
+export TF_VAR_cloudsql_root_password='REPLACE_ME'
+export TF_VAR_source_gce_mysql_password='REPLACE_ME_MAX_32_CHARS'
 ```
 
 ### 2. Initialize and Validate
@@ -65,23 +73,25 @@ terraform apply tfplan
 
 ### 4. Verify & Start the DMS Migration Job
 
-After Terraform provisions the connection profiles and migration job:
+After Terraform creates the connection profiles and the migration job and demotes the destination:
 
 ```bash
 # Verify pre-flight connectivity and MySQL 8.0 replication configuration
 gcloud database-migration migration-jobs verify gce-live-mysql80-cdc \
-  --region=asia-southeast1
+  --region=europe-west2
 
 # Start the live initial dump + continuous CDC replication
 gcloud database-migration migration-jobs start gce-live-mysql80-cdc \
-  --region=asia-southeast1
+  --region=europe-west2
 ```
 
 ### 5. Cutover / Promotion
 
-Once `replication_lag` reaches `0 seconds` during the cutover window, stop writes on the GCE MySQL 8.0 instance and promote the Cloud SQL destination:
+Monitor `datamigration.googleapis.com/migration_job/max_replica_sec_lag` in Cloud Monitoring. When the lag is near `0` during the cutover window, stop writes on the source MySQL 8.0 instance and promote the Cloud SQL destination:
 
 ```bash
 gcloud database-migration migration-jobs promote gce-live-mysql80-cdc \
-  --region=asia-southeast1
+  --region=europe-west2
 ```
+
+Then point applications to the `psc_endpoint_dns_name` Terraform output.

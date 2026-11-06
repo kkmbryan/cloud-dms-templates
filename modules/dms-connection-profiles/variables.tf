@@ -37,15 +37,14 @@ variable "source_username" {
 }
 
 variable "source_password" {
-  description = "Database replication/migration password on the source GCE MySQL 8.0 instance."
+  description = "Password of the migration user on the source MySQL instance (DMS limit: 32 characters or fewer)."
   type        = string
   sensitive   = true
-}
 
-variable "private_connection_id" {
-  description = "Short ID or resource name of the Cloud DMS Private Connection used by the source MySQL connection profile when destination_mode is EXISTING_CLOUDSQL with PSC."
-  type        = string
-  default     = ""
+  validation {
+    condition     = length(var.source_password) > 0 && length(var.source_password) <= 32
+    error_message = "source_password must be 1-32 characters long (Database Migration Service limit)."
+  }
 }
 
 variable "source_ssl_ca_certificate" {
@@ -91,34 +90,9 @@ variable "destination_mode" {
 }
 
 variable "destination_cloud_sql_id" {
-  description = "The Cloud SQL instance ID (name) when destination_mode is EXISTING_CLOUDSQL."
+  description = "The Cloud SQL instance ID (name) of the existing destination when destination_mode is EXISTING_CLOUDSQL."
   type        = string
   default     = ""
-}
-
-variable "destination_host" {
-  description = "The private IP or PSC DNS/IP hostname of the existing Cloud SQL instance when destination_mode is EXISTING_CLOUDSQL."
-  type        = string
-  default     = ""
-}
-
-variable "destination_port" {
-  description = "The MySQL port on the existing Cloud SQL destination instance."
-  type        = number
-  default     = 3306
-}
-
-variable "destination_username" {
-  description = "The username used by DMS to connect to the existing Cloud SQL destination instance."
-  type        = string
-  default     = "root"
-}
-
-variable "destination_password" {
-  description = "The password used by DMS to connect to the existing Cloud SQL destination instance."
-  type        = string
-  default     = ""
-  sensitive   = true
 }
 
 variable "dest_database_version" {
@@ -142,12 +116,6 @@ variable "dest_tier" {
   description = "Cloud SQL machine tier when destination_mode is DMS_MANAGED_CLOUDSQL."
   type        = string
   default     = "db-perf-optimized-N-8"
-}
-
-variable "dest_availability_type" {
-  description = "Cloud SQL availability type when destination_mode is DMS_MANAGED_CLOUDSQL (REGIONAL or ZONAL)."
-  type        = string
-  default     = "REGIONAL"
 }
 
 variable "dest_disk_size_gb" {

@@ -4,7 +4,7 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "The GCP region for the Private Service Connect Network Attachment and DMS Private Connection."
+  description = "The GCP region for the Private Service Connect Network Attachment."
   type        = string
 }
 
@@ -36,12 +36,6 @@ variable "network_attachment_name" {
   default     = "dms-mysql-psc-na"
 }
 
-variable "private_connection_id" {
-  description = "ID of the Cloud Database Migration Service Private Connection resource."
-  type        = string
-  default     = "dms-mysql-psc-pc"
-}
-
 variable "dms_tenant_project_id" {
   description = "Optional Google-managed DMS/Cloud SQL tenant project ID (e.g., 'p123456-abcdef-tp') to add to the PSC Network Attachment producer_accept_lists."
   type        = string
@@ -52,12 +46,6 @@ variable "psc_connection_preference" {
   description = "Connection preference for the PSC Network Attachment ('ACCEPT_MANUAL' or 'ACCEPT_AUTOMATIC'). When dms_tenant_project_id is known, 'ACCEPT_MANUAL' is enforced."
   type        = string
   default     = "ACCEPT_AUTOMATIC"
-}
-
-variable "create_dms_private_connection" {
-  description = "Whether to provision a dedicated google_database_migration_service_private_connection resource. Defaults to false because EXISTING_CLOUDSQL PSC migrations attach Cloud SQL's psc_config.network_attachment_uri directly to the Compute Engine Network Attachment for outbound replication and do not require a separate DMS Private Connection resource."
-  type        = bool
-  default     = false
 }
 
 variable "psa_allocated_ip_range_name" {

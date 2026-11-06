@@ -25,14 +25,14 @@ variable "retention_days" {
   default     = 14
 }
 
-variable "dms_service_account_email" {
-  description = "Cloud DMS / Cloud SQL service agent email (e.g., 'service-PROJECT_NUMBER@gcp-sa-datamigration.iam.gserviceaccount.com') granted read access to the staging bucket."
-  type        = string
-  default     = ""
+variable "reader_members" {
+  description = "Map of static label => principal that gets read access (roles/storage.objectViewer + roles/storage.legacyBucketReader) on the bucket. Values can be a bare service account email or a full IAM member string (for example serviceAccount:..., group:...). Use static keys such as \"cloudsql_instance_sa\" and \"dms_service_agent\"."
+  type        = map(string)
+  default     = {}
 }
 
 variable "backup_writer_members" {
-  description = "List of IAM principals (e.g., ['serviceAccount:gce-mysql-backup@project.iam.gserviceaccount.com']) granted roles/storage.objectAdmin to upload Percona XtraBackup or mysqldump files."
+  description = "List of IAM principals (for example ['serviceAccount:mysql-backup@my-project.iam.gserviceaccount.com']) granted roles/storage.objectCreator to upload the Percona XtraBackup folder or mysqldump file."
   type        = list(string)
   default     = []
 }

@@ -4,9 +4,9 @@ variable "project_id" {
 }
 
 variable "region" {
-  description = "The GCP region for the migration (e.g., asia-southeast1 or australia-southeast1)."
+  description = "The GCP region for the migration. The Cloud SQL instance, DMS resources and (Scenario 2) the staging bucket must all be in this region."
   type        = string
-  default     = "asia-southeast1"
+  default     = "europe-west2"
 }
 
 variable "connectivity_type" {
@@ -45,7 +45,7 @@ variable "create_psa_peering" {
 
 # Cloud SQL Destination Configuration
 variable "destination_mode" {
-  description = "Destination provisioning mode: 'EXISTING_CLOUDSQL' (recommended default: provisions a standalone Cloud SQL instance with Private Service Connect, No Public IP, and PSC Outbound Network Attachment network_attachment_uri, and demotes it for DMS replication) or 'DMS_MANAGED_CLOUDSQL'."
+  description = "Destination provisioning mode: 'EXISTING_CLOUDSQL' (default: Terraform creates a PSC-only Cloud SQL instance with no public IP, attaches the Network Attachment, and demotes it for DMS) or 'DMS_MANAGED_CLOUDSQL' (DMS creates the instance from the cloudsql settings in the destination connection profile)."
   type        = string
   default     = "EXISTING_CLOUDSQL"
 
@@ -68,7 +68,7 @@ variable "cloudsql_instance_name" {
 }
 
 variable "target_database_version" {
-  description = "Target Cloud SQL for MySQL version ('MYSQL_8_4' default LTS or 'MYSQL_8_0'). Cloud DMS migrates from MySQL 8.0 to 8.0 or 8.4 (cannot skip directly to 9.7)."
+  description = "Target Cloud SQL for MySQL version ('MYSQL_8_4' default or 'MYSQL_8_0'). This template supports MySQL 8.0 sources to 8.0 or 8.4 targets."
   type        = string
   default     = "MYSQL_8_4"
 
@@ -79,7 +79,7 @@ variable "target_database_version" {
 }
 
 variable "cloudsql_edition" {
-  description = "Cloud SQL edition ('ENTERPRISE_PLUS' default for sub-second near-zero downtime HA & Data Cache, or 'ENTERPRISE')."
+  description = "Cloud SQL edition ('ENTERPRISE_PLUS' default, with Data Cache, or 'ENTERPRISE')."
   type        = string
   default     = "ENTERPRISE_PLUS"
 }
@@ -103,15 +103,58 @@ variable "cloudsql_disk_size_gb" {
 }
 
 variable "cloudsql_root_password" {
-  description = "Root password for the destination Cloud SQL instance."
+  description = "Initial root password for the destination Cloud SQL instance. Sent through the write-only root_password_wo argument (EXISTING_CLOUDSQL), so it is not stored in Terraform state."
   type        = string
   sensitive   = true
+}
+
+variable "cloudsql_root_password_version" {
+  description = "Version of the write-only Cloud SQL root password. Increment it to push a new cloudsql_root_password to the instance (the password is never stored in Terraform state)."
+  type        = number
+  default     = 1
 }
 
 variable "cloudsql_deletion_protection" {
   description = "Whether deletion protection is enabled on the destination Cloud SQL instance."
   type        = bool
   default     = true
+}
+
+# PSC consumer endpoint + private DNS (application access after promotion)
+variable "create_psc_endpoint" {
+  description = "Create a PSC consumer endpoint (internal IP + forwarding rule) and a private DNS record for the Cloud SQL instance in var.network. Applies when destination_mode = EXISTING_CLOUDSQL and connectivity_type = PSC."
+  type        = bool
+  default     = true
+}
+
+variable "psc_endpoint_subnet" {
+  description = "Subnet (self-link or ID) for the PSC endpoint IP address, normally the application subnet. Defaults to var.subnet when empty."
+  type        = string
+  default     = ""
+}
+
+variable "psc_endpoint_ip_address" {
+  description = "Optional fixed internal IP address for the PSC endpoint. Leave empty to let Google Cloud choose one."
+  type        = string
+  default     = ""
+}
+
+variable "psc_endpoint_global_access" {
+  description = "Allow clients in other regions to use the PSC endpoint."
+  type        = bool
+  default     = false
+}
+
+variable "create_psc_dns_record" {
+  description = "Create an A record for the instance DNS name (cloudsql_dns_name) that points to the PSC endpoint IP."
+  type        = bool
+  default     = true
+}
+
+variable "psc_existing_dns_zone_name" {
+  description = "Name of an existing private Cloud DNS zone for '<region>.sql.goog.' bound to var.network. When empty, a new private zone is created. Set this if the VPC already has such a zone (for example for other Cloud SQL PSC instances)."
+  type        = string
+  default     = ""
 }
 
 # Source GCE MySQL 8.0 Connection Profile Configuration
@@ -127,21 +170,15 @@ variable "source_gce_mysql_port" {
 }
 
 variable "source_gce_mysql_username" {
-  description = "Dedicated migration & replication username on the source GCE MySQL 8.0 instance."
+  description = "Dedicated DMS migration user on the source MySQL 8.0 instance (created as 'dms_migration'@'%'; see the runbook for grants)."
   type        = string
-  default     = "dms_repl_user"
+  default     = "dms_migration"
 }
 
 variable "source_gce_mysql_password" {
-  description = "Password for the source GCE MySQL 8.0 migration user."
+  description = "Password of the source migration user (32 characters or fewer)."
   type        = string
   sensitive   = true
-}
-
-variable "destination_connection_host" {
-  description = "Optional override for destination Cloud SQL host IP/DNS in the DMS connection profile (defaults to Cloud SQL private IP or PSC DNS name)."
-  type        = string
-  default     = ""
 }
 
 # DMS Live Migration + CDC Job Configuration
@@ -152,15 +189,25 @@ variable "migration_job_id" {
 }
 
 variable "dump_parallel_level" {
-  description = "Parallelism level during the live initial logical dump ('MIN', 'OPTIMAL', or 'MAX')."
+  description = "Parallelism of the DMS-managed initial logical dump ('MIN', 'OPTIMAL' or 'MAX'). OPTIMAL is the DMS recommendation; MAX adds load on the source."
   type        = string
-  default     = "MAX"
+  default     = "OPTIMAL"
+
+  validation {
+    condition     = contains(["MIN", "OPTIMAL", "MAX"], var.dump_parallel_level)
+    error_message = "dump_parallel_level must be one of \"MIN\", \"OPTIMAL\" or \"MAX\"."
+  }
 }
 
 variable "connectivity_method" {
-  description = "Connectivity method used by the DMS migration job to reach the source GCE MySQL 8.0 VM ('VPC_PEERING', 'REVERSE_SSH', or 'STATIC_IP')."
+  description = "DMS_MANAGED_CLOUDSQL only: connectivity method for the migration job ('VPC_PEERING', 'REVERSE_SSH' or 'STATIC_IP'). Ignored for EXISTING_CLOUDSQL, which uses the PSC interface."
   type        = string
   default     = "VPC_PEERING"
+
+  validation {
+    condition     = contains(["VPC_PEERING", "REVERSE_SSH", "STATIC_IP"], var.connectivity_method)
+    error_message = "connectivity_method must be one of \"VPC_PEERING\", \"REVERSE_SSH\" or \"STATIC_IP\"."
+  }
 }
 
 variable "reverse_ssh_vm_ip" {

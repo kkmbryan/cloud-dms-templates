@@ -11,7 +11,7 @@ variable "region" {
 variable "migration_job_id" {
   description = "The unique identifier for the DMS migration job."
   type        = string
-  default     = "gce-mysql80-to-cloudsql-cdc"
+  default     = "gce-live-mysql80-cdc"
 }
 
 variable "display_name" {
@@ -42,7 +42,7 @@ variable "destination_connection_profile" {
 }
 
 variable "destination_mode" {
-  description = "Destination provisioning mode: EXISTING_CLOUDSQL (default, provisions a standalone Cloud SQL instance with Private Service Connect and PSC Outbound Network Attachment network_attachment_uri and demotes it for DMS replication) or DMS_MANAGED_CLOUDSQL."
+  description = "Destination provisioning mode: EXISTING_CLOUDSQL (default: the job targets a Terraform-created, PSC-enabled Cloud SQL instance with a Network Attachment and demotes it before start) or DMS_MANAGED_CLOUDSQL (DMS creates the instance)."
   type        = string
   default     = "EXISTING_CLOUDSQL"
 
@@ -64,15 +64,15 @@ variable "dump_type" {
 }
 
 variable "dump_path" {
-  description = "GCS URI path (gs://<bucket>/<object>) to a pre-staged backup file in Cloud Storage for Scenario 2 (Backup in GCS + CDC). Leave null or empty for Scenario 1 (Live Migration + CDC). Mutually exclusive with dump_flags."
+  description = "Scenario 2 only: GCS location of the pre-staged seed. LOGICAL: one mysqldump file (gs://<bucket>/<path>.sql.gz). PHYSICAL: the dedicated folder that holds a prepared Percona XtraBackup backup (gs://<bucket>/<folder>, no trailing slash). Leave null or empty for Scenario 1 (DMS-managed dump). Mutually exclusive with dump_flags."
   type        = string
   default     = null
 }
 
 variable "dump_parallel_level" {
-  description = "Parallelism level during DMS-managed initial dump (MIN, OPTIMAL, or MAX). Used when dump_path is null/empty."
+  description = "Parallelism level during the DMS-managed initial dump (MIN, OPTIMAL, or MAX). Used only when dump_path is null or empty. OPTIMAL is the DMS recommendation; MAX adds load on the source."
   type        = string
-  default     = "MAX"
+  default     = "OPTIMAL"
 
   validation {
     condition     = contains(["MIN", "OPTIMAL", "MAX"], var.dump_parallel_level)
@@ -90,7 +90,7 @@ variable "dump_flags" {
 }
 
 variable "connectivity_method" {
-  description = "Network connectivity method used by the DMS migration job to reach the source GCE MySQL 8.0 VM: VPC_PEERING, REVERSE_SSH, or STATIC_IP."
+  description = "DMS_MANAGED_CLOUDSQL only: connectivity method used by the migration job to reach the source (VPC_PEERING, REVERSE_SSH, or STATIC_IP). Ignored for EXISTING_CLOUDSQL, which uses the instance's PSC interface (Network Attachment)."
   type        = string
   default     = "VPC_PEERING"
 
@@ -128,6 +128,18 @@ variable "reverse_ssh_vpc" {
   description = "VPC network name for reverse SSH connectivity."
   type        = string
   default     = ""
+}
+
+variable "demote_destination" {
+  description = "EXISTING_CLOUDSQL only: run `gcloud database-migration migration-jobs demote-destination` after the job is created."
+  type        = bool
+  default     = true
+}
+
+variable "demote_timeout_seconds" {
+  description = "Maximum time in seconds to wait for the demote-destination operation before failing the apply."
+  type        = number
+  default     = 3600
 }
 
 variable "labels" {
