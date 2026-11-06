@@ -1,22 +1,38 @@
 # ==============================================================================
-# Scenario 2: Backup in GCS (XtraBackup / mysqldump) + CDC Example
+# Scenario 2: Seed from a backup in GCS (mysqldump / XtraBackup) + CDC
 # ==============================================================================
+# Copy to terraform.tfvars (git-ignored). Prefer TF_VAR_cloudsql_root_password
+# and TF_VAR_source_gce_mysql_password environment variables over writing
+# passwords to disk.
 
 project_id            = "my-gcp-project-01"
-region                = "asia-southeast1"
+region                = "europe-west2"
 connectivity_type     = "PSC"
-network               = "projects/my-gcp-project-01/global/networks/prod-vpc"
-subnet                = "projects/my-gcp-project-01/regions/asia-southeast1/subnetworks/db-subnet-sg"
-dms_tenant_project_id = "" # Populate with 'p123456-abcdef-tp' once Cloud SQL/DMS tenant project is generated
+network               = "projects/my-gcp-project-01/global/networks/my-vpc"
+subnet                = "projects/my-gcp-project-01/regions/europe-west2/subnetworks/db-subnet" # Network Attachment subnet
+dms_tenant_project_id = ""
 
-# GCS Staging Bucket & Backup Object Configuration
-staging_bucket_name           = "prod-dms-mysql80-staging-sg"
+# PSC consumer endpoint + private DNS for applications (created by default)
+create_psc_endpoint = true
+psc_endpoint_subnet = "projects/my-gcp-project-01/regions/europe-west2/subnetworks/app-subnet"
+
+# GCS staging bucket and seed location
+# Read access for the DMS service agent and the Cloud SQL instance service
+# account is granted automatically.
+staging_bucket_name           = "my-dms-staging-bucket"
 staging_bucket_retention_days = 14
-dms_service_account_email     = "service-123456789012@gcp-sa-datamigration.iam.gserviceaccount.com"
-backup_writer_members         = ["serviceAccount:gce-mysql80-sa@my-gcp-project-01.iam.gserviceaccount.com"]
-backup_object_path            = "backups/mysql80-full.xbstream"
+backup_writer_members         = ["serviceAccount:mysql-source-vm@my-gcp-project-01.iam.gserviceaccount.com"]
 
-# Destination Cloud SQL Configuration (MYSQL_8_4 default or MYSQL_8_0)
+# Seed format (see the support matrix in README.md):
+#   LOGICAL  (default): one mysqldump file; MYSQL_8_0 or MYSQL_8_4 target.
+#   PHYSICAL          : dedicated folder with a prepared XtraBackup; MYSQL_8_0 target only.
+dump_type       = "LOGICAL"
+backup_gcs_path = "mysqldump/mysql80-dump.sql.gz"
+# dump_type               = "PHYSICAL"
+# backup_gcs_path         = "xtrabackup/mysql80-full"
+# target_database_version = "MYSQL_8_0"
+
+# Destination Cloud SQL configuration (MYSQL_8_4 default or MYSQL_8_0)
 cloudsql_instance_name       = "cloudsql-mysql-dest-bkp-01"
 target_database_version      = "MYSQL_8_4"
 cloudsql_edition             = "ENTERPRISE_PLUS"
@@ -26,13 +42,11 @@ cloudsql_disk_size_gb        = 1000
 cloudsql_root_password       = "REPLACE_WITH_SECURE_ROOT_PASSWORD"
 cloudsql_deletion_protection = true
 
-# Source GCE MySQL 8.0 VM Configuration (for ongoing Binlog CDC after GCS restore)
-source_gce_mysql_host     = "10.148.0.25"
+# Source MySQL 8.0 VM (binlog CDC after the seed is restored)
+source_gce_mysql_host     = "10.10.0.10"
 source_gce_mysql_port     = 3306
-source_gce_mysql_username = "dms_repl_user"
-source_gce_mysql_password = "REPLACE_WITH_SECURE_REPL_PASSWORD"
+source_gce_mysql_username = "dms_migration"
+source_gce_mysql_password = "REPLACE_ME_MAX_32_CHARS"
 
-# DMS Backup-Seeded Migration + CDC Job Configuration
-migration_job_id    = "gcs-bkp-mysql80-cdc"
-dump_type           = "PHYSICAL" # Use "PHYSICAL" for Percona XtraBackup or "LOGICAL" for mysqldump
-connectivity_method = "VPC_PEERING"
+# DMS backup-seeded migration + CDC job
+migration_job_id = "gcs-bkp-mysql80-cdc"

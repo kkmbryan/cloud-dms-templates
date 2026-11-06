@@ -8,6 +8,8 @@ locals {
 
   user_flag_names = [for f in var.database_flags : f.name]
 
+  psc_network_attachment_uri = var.psc_network_attachment_uri == null ? "" : replace(var.psc_network_attachment_uri, "https://www.googleapis.com/compute/v1/", "")
+
   merged_database_flags = concat(
     [for df in local.default_flags : df if !contains(local.user_flag_names, df.name)],
     var.database_flags
@@ -21,8 +23,13 @@ resource "google_sql_database_instance" "destination" {
   name                = var.instance_name
   region              = var.region
   database_version    = var.database_version
-  root_password       = var.root_password
   deletion_protection = var.deletion_protection
+
+  # Write-only argument (Terraform >= 1.11): the root password is sent to the
+  # API but not stored in Terraform state. A saved plan file (terraform plan
+  # -out) still contains root module input variables, so protect plan files.
+  root_password_wo         = var.root_password
+  root_password_wo_version = nonsensitive(var.root_password != null) ? tostring(var.root_password_wo_version) : null
 
   settings {
     tier                        = var.tier
@@ -79,35 +86,61 @@ resource "google_sql_database_instance" "destination" {
   }
 }
 
+# ------------------------------------------------------------------------------
+# PSC outbound (PSC interface): attach the Network Attachment to the instance so
+# that Cloud SQL (and DMS replication) can reach the source in the consumer VPC.
+# psc_config is in ignore_changes above, so this step is the single owner of
+# networkAttachmentUri. It fails the apply if the patch does not take effect.
+# ------------------------------------------------------------------------------
 resource "terraform_data" "psc_outbound_network_attachment" {
-  count = var.enabled && var.connectivity_type == "PSC" && var.psc_network_attachment_uri != null && var.psc_network_attachment_uri != "" ? 1 : 0
+  # Use a plan-time boolean: the attachment URI itself is unknown until the
+  # Network Attachment exists.
+  count = var.enabled && var.connectivity_type == "PSC" && var.psc_outbound_enabled ? 1 : 0
 
-  depends_on = [google_sql_database_instance.destination]
+  triggers_replace = [
+    google_sql_database_instance.destination[0].name,
+    local.psc_network_attachment_uri,
+  ]
+
+  lifecycle {
+    precondition {
+      condition     = local.psc_network_attachment_uri != ""
+      error_message = "psc_network_attachment_uri must be set when psc_outbound_enabled = true."
+    }
+  }
 
   input = {
     project_id                 = var.project_id
     instance_name              = google_sql_database_instance.destination[0].name
-    psc_network_attachment_uri = replace(var.psc_network_attachment_uri, "https://www.googleapis.com/compute/v1/", "")
+    psc_network_attachment_uri = local.psc_network_attachment_uri
   }
 
   provisioner "local-exec" {
-    command = <<-EOT
-      set -e
-      CURRENT_NA=$(gcloud sql instances describe "${self.input.instance_name}" \
-        --project="${self.input.project_id}" \
-        --format="value(settings.ipConfiguration.pscConfig.networkAttachmentUri)" || true)
-      if [ "$${CURRENT_NA}" != "${self.input.psc_network_attachment_uri}" ]; then
-        ACCESS_TOKEN=$(gcloud auth application-default print-access-token)
-        OP_NAME=$(curl -s -X PATCH \
-          -H "Authorization: Bearer $${ACCESS_TOKEN}" \
-          -H "Content-Type: application/json" \
-          "https://sqladmin.googleapis.com/v1/projects/${self.input.project_id}/instances/${self.input.instance_name}" \
-          -d "{\"settings\":{\"ipConfiguration\":{\"pscConfig\":{\"pscEnabled\":true,\"networkAttachmentUri\":\"${self.input.psc_network_attachment_uri}\"}}}}" \
-          | python3 -c "import sys, json; print(json.load(sys.stdin).get('name', ''))")
-        if [ -n "$${OP_NAME}" ]; then
-          gcloud sql operations wait "$${OP_NAME}" --project="${self.input.project_id}" --timeout=600
-        fi
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -euo pipefail
+      PROJECT="${self.input.project_id}"
+      INSTANCE="${self.input.instance_name}"
+      WANT="${self.input.psc_network_attachment_uri}"
+
+      current_na() {
+        gcloud sql instances describe "$${INSTANCE}" --project="$${PROJECT}" \
+          --format="value(settings.ipConfiguration.pscConfig.networkAttachmentUri)" \
+          | sed -e 's#^https://www.googleapis.com/compute/v1/##'
+      }
+
+      if [ "$(current_na)" != "$${WANT}" ]; then
+        echo "Attaching network attachment $${WANT} to Cloud SQL instance $${INSTANCE}..."
+        gcloud sql instances patch "$${INSTANCE}" --project="$${PROJECT}" \
+          --psc-network-attachment-uri="$${WANT}" --quiet
       fi
+
+      ACTUAL="$(current_na)"
+      if [ "$${ACTUAL}" != "$${WANT}" ]; then
+        echo "ERROR: networkAttachmentUri is '$${ACTUAL}', expected '$${WANT}'." >&2
+        exit 1
+      fi
+      echo "Network attachment verified on $${INSTANCE}."
     EOT
   }
 }

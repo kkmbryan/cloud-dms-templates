@@ -10,6 +10,8 @@ locals {
 
 # ------------------------------------------------------------------------------
 # Private Service Connect (PSC) - Recommended Default
+# The Network Attachment lets the destination Cloud SQL instance open a PSC
+# interface into this subnet so that DMS replication reaches the source.
 # ------------------------------------------------------------------------------
 
 resource "google_compute_network_attachment" "dms_psc" {
@@ -18,24 +20,10 @@ resource "google_compute_network_attachment" "dms_psc" {
   project               = var.project_id
   name                  = var.network_attachment_name
   region                = var.region
-  description           = "Private Service Connect Network Attachment for Cloud DMS and Cloud SQL MySQL connectivity"
+  description           = "PSC Network Attachment used by the Cloud SQL destination (PSC interface) to reach the source MySQL during DMS replication"
   connection_preference = var.dms_tenant_project_id != "" ? "ACCEPT_MANUAL" : var.psc_connection_preference
   subnetworks           = [var.subnet]
   producer_accept_lists = (var.dms_tenant_project_id != "" || var.psc_connection_preference == "ACCEPT_MANUAL") ? local.producer_accept_list : null
-}
-
-resource "google_database_migration_service_private_connection" "dms_psc" {
-  count = local.is_psc && var.create_dms_private_connection ? 1 : 0
-
-  project               = var.project_id
-  location              = var.region
-  private_connection_id = var.private_connection_id
-  display_name          = var.private_connection_id
-  labels                = var.labels
-
-  psc_interface_config {
-    network_attachment = google_compute_network_attachment.dms_psc[0].id
-  }
 }
 
 # ------------------------------------------------------------------------------

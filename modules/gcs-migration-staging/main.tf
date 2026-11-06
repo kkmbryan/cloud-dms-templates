@@ -29,26 +29,39 @@ resource "google_storage_bucket" "migration_staging" {
   }
 }
 
-resource "google_storage_bucket_iam_member" "dms_object_viewer" {
-  count = var.dms_service_account_email != "" ? 1 : 0
+locals {
+  # DMS and the destination Cloud SQL instance service account both need to
+  # list the bucket and read the seed objects.
+  # Reference: https://cloud.google.com/database-migration/docs/mysql/migrate-with-physical-xtrabackup
+  reader_roles = ["roles/storage.objectViewer", "roles/storage.legacyBucketReader"]
 
-  bucket = google_storage_bucket.migration_staging.name
-  role   = "roles/storage.objectViewer"
-  member = startswith(var.dms_service_account_email, "serviceAccount:") ? var.dms_service_account_email : "serviceAccount:${var.dms_service_account_email}"
+  # Keys are static labels so that for_each works even when a member email is
+  # only known after apply (for example the Cloud SQL instance service account).
+  reader_bindings = {
+    for pair in setproduct(keys(var.reader_members), local.reader_roles) :
+    "${pair[0]}/${pair[1]}" => {
+      # A bare email is treated as a service account; anything with a type
+      # prefix (serviceAccount:, group:, user:, ...) is used as is.
+      member = strcontains(var.reader_members[pair[0]], ":") ? var.reader_members[pair[0]] : "serviceAccount:${var.reader_members[pair[0]]}"
+      role   = pair[1]
+    }
+  }
 }
 
-resource "google_storage_bucket_iam_member" "dms_legacy_bucket_reader" {
-  count = var.dms_service_account_email != "" ? 1 : 0
+resource "google_storage_bucket_iam_member" "readers" {
+  for_each = local.reader_bindings
 
   bucket = google_storage_bucket.migration_staging.name
-  role   = "roles/storage.legacyBucketReader"
-  member = startswith(var.dms_service_account_email, "serviceAccount:") ? var.dms_service_account_email : "serviceAccount:${var.dms_service_account_email}"
+  role   = each.value.role
+  member = each.value.member
 }
 
+# Writers only need to create objects (upload the dump). They can't delete or
+# overwrite existing backup objects.
 resource "google_storage_bucket_iam_member" "backup_writers" {
   for_each = toset(var.backup_writer_members)
 
   bucket = google_storage_bucket.migration_staging.name
-  role   = "roles/storage.objectAdmin"
+  role   = "roles/storage.objectCreator"
   member = each.value
 }
